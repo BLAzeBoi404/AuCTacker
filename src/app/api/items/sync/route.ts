@@ -1,10 +1,19 @@
 import { NextResponse } from "next/server";
 import { syncItemsFromGithub } from "@/lib/exbo";
+import { ensureSchema } from "@/lib/ensure-schema";
 
 export const dynamic = "force-dynamic";
+// Синхронизация тянет мегабайты с GitHub + пишет тысячи строк:
+// даём запас по времени, чтобы холодный Neon успевал проснуться
+export const maxDuration = 120;
 
 export async function POST() {
   try {
+    try {
+      await ensureSchema();
+    } catch (e) {
+      console.error("ensureSchema failed:", e);
+    }
     const r = await syncItemsFromGithub();
     return NextResponse.json({ success: true, count: r.count });
   } catch (e) {

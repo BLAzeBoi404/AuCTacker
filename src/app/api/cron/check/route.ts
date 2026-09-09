@@ -11,6 +11,12 @@ export const dynamic = "force-dynamic";
 // URL: /api/cron/check?secret=XXX (секрет — в Настройках сайта)
 export async function GET(req: NextRequest) {
   void ensureScheduler();
+  try {
+    const { ensureSchema } = await import("@/lib/ensure-schema");
+    await ensureSchema();
+  } catch {
+    /* таблицы создадутся следующим разом, проверку всё равно пробуем */
+  }
   const secret = await getOrCreateSecret();
   const got =
     req.nextUrl.searchParams.get("secret") ||

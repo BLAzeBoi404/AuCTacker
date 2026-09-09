@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fetchHistoryPages, normalizeRegion } from "@/lib/exbo";
+import { fetchHistory, normalizeRegion } from "@/lib/exbo";
 import { QUALITY_NAMES } from "@/lib/constants";
 
 export const dynamic = "force-dynamic";
@@ -15,12 +15,26 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    // Все страницы запрашиваются параллельно — в разы быстрее
-    // последовательного перебора (EAPI поддерживает максимум 100 за запрос).
-    const pages = Math.ceil(limit / 100);
-    const { history: all, total } = await fetchHistoryPages(itemId, region, pages);
+    const pageSize = 100;
+    let all: Awaited<ReturnType<typeof fetchHistory>>["history"] = [];
+    let total = 0;
+    for (let off = 0; off < limit; off += pageSize) {
+      const chunkLimit = Math.min(pageSize, limit - off);
+      const r = await fetchHistory(itemId, region, chunkLimit, off);
+      total = r.total;
+      if (r.history.length === 0) break;
+      all = all.concat(r.history);
+      if (r.history.length < chunkLimit) break;
+    }
 
-    const history = all.slice(0, limit).map((h, i) => ({
+    // Сортируем по времени (новые сверху) — API иногда отдаёт вперемешку
+    all.sort((a, b) => {
+      const ta = a.time ? new Date(a.time).getTime() : 0;
+      const tb = b.time ? new Date(b.time).getTime() : 0;
+      return tb - ta;
+    });
+
+    const history = all.map((h, i) => ({
       ...h,
       id: `${h.id}-${i}`,
       qualityName: QUALITY_NAMES[h.quality] ?? "Обычный",

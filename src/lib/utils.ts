@@ -4,9 +4,18 @@ export function formatPrice(price: number | null | undefined): string {
 }
 
 export function formatCompact(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)} млн`;
-  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)} тыс`;
-  return String(n);
+  if (!Number.isFinite(n)) return "—";
+  const sign = n < 0 ? "-" : "";
+  const a = Math.abs(Math.round(n));
+  const fmt = (v: number, maxDec: number) =>
+    sign +
+    v
+      .toFixed(maxDec)
+      .replace(/\.?0+$/, "")
+      .replace(".", ",");
+  if (a >= 1_000_000) return `${fmt(a / 1_000_000, 2)} млн`;
+  if (a >= 1_000) return `${fmt(a / 1_000, 1)} тыс`;
+  return `${sign}${a}`;
 }
 
 export function getTimeLeft(endTime: string | null | undefined): string {

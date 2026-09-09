@@ -2,11 +2,18 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { sql } from "drizzle-orm";
 import { ensureItemsSeeded } from "@/lib/exbo";
+import { ensureSchema } from "@/lib/ensure-schema";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   try {
+    // На свежей базе таблиц может не быть — без этого count упадёт и вернётся вечный ноль
+    try {
+      await ensureSchema();
+    } catch (e) {
+      console.error("ensureSchema failed:", e);
+    }
     await ensureItemsSeeded();
     const { searchParams } = new URL(req.url);
     const q = (searchParams.get("q") || "").trim();
@@ -54,6 +61,8 @@ export async function GET(req: NextRequest) {
       items: rowsRes.rows,
       total,
       categories,
+      // Фронт по этому флагу показывает кнопку «Загрузить базу предметов»
+      needsSync: total === 0,
     });
   } catch (e) {
     console.error("GET /api/items failed:", e);

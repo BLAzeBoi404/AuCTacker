@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fetchHistoryPages, fetchLotExtremes, normalizeRegion } from "@/lib/exbo";
+import { fetchHistory, fetchLots, normalizeRegion } from "@/lib/exbo";
 
 export const dynamic = "force-dynamic";
 
@@ -10,13 +10,26 @@ export async function GET(req: NextRequest) {
   if (!itemId) return NextResponse.json({ success: false, error: "itemId_required" });
 
   try {
-    const [extremes, histRes] = await Promise.all([
-      fetchLotExtremes(itemId, region),
-      fetchHistoryPages(itemId, region, 2), // 200 последних продаж — для средней/динамики
+    const [lotsRes, histRes] = await Promise.all([
+      fetchLots(itemId, region, 100, 0),
+      fetchHistory(itemId, region, 100, 0),
     ]);
 
-    const histPrices = histRes.history.map((h) => h.price).filter((p) => p > 0);
-    const histSorted = histRes.history; // уже отсортирована по времени (новые сверху)
+    // Цены за штуку: в API суммы указаны за весь стак, делим на количество
+    const perUnit = (price: number, amount: number) =>
+      amount > 1 ? Math.round(price / amount) : price;
+    const lotPrices = lotsRes.lots
+      .map((l) => perUnit(l.buyoutPrice || l.startPrice, l.amount))
+      .filter((p) => p > 0);
+    const histPrices = histRes.history
+      .map((h) => perUnit(h.price, h.amount))
+      .filter((p) => p > 0);
+
+    const histSorted = [...histRes.history].sort((a, b) => {
+      const ta = a.time ? new Date(a.time).getTime() : 0;
+      const tb = b.time ? new Date(b.time).getTime() : 0;
+      return tb - ta;
+    });
 
     // Изменение за 24ч
     const now = Date.now();
@@ -33,9 +46,10 @@ export async function GET(req: NextRequest) {
       success: true,
       region,
       lots: {
-        count: extremes.total,
-        min: extremes.min ? extremes.min.buyoutPrice || extremes.min.startPrice : 0,
-        max: extremes.max ? extremes.max.buyoutPrice || extremes.max.startPrice : 0,
+        count: lotsRes.total,
+        min: lotPrices.length ? Math.min(...lotPrices) : 0,
+        max: lotPrices.length ? Math.max(...lotPrices) : 0,
+        avg: lotPrices.length ? Math.round(avg(lotPrices)) : 0,
       },
       history: {
         count: histRes.total,

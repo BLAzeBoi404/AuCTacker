@@ -1,7 +1,7 @@
 import { db } from "@/db";
 import { trackers, notifications } from "@/db/schema";
 import { eq, sql } from "drizzle-orm";
-import { fetchLotsPages, type NormalizedLot } from "./exbo";
+import { fetchLots, type NormalizedLot } from "./exbo";
 import { QUALITY_NAMES } from "./constants";
 import { getSetting } from "./settings";
 import { getActiveChats, sendTelegramMessage, esc } from "./telegram";
@@ -68,35 +68,20 @@ export async function runTrackerCheck(source: string): Promise<CheckResult> {
   let telegramSent = 0;
   let notifInserted = 0;
 
-  // Все предметы проверяются параллельно — при десятках трекеров это
-  // разница между секундами и долями секунды.
-  const groupEntries = Array.from(groups.entries());
-  const groupLotsResults = await Promise.all(
-    groupEntries.map(async ([key]) => {
-      const [itemId, region] = key.split("|");
-      try {
-        // Смотрим оба конца ценового диапазона параллельно: 100 самых
-        // дешёвых (кто ищет выгодную цену) + 100 самых дорогих (кто ищет
-        // редкую заточку/качество вне зависимости от цены). Так трекер не
-        // пропустит совпадение, даже если у предмета тысячи активных лотов.
-        const [cheap, expensive] = await Promise.all([
-          fetchLotsPages(itemId, region, 1, "buyout_price", "asc"),
-          fetchLotsPages(itemId, region, 1, "buyout_price", "desc"),
-        ]);
-        const byId = new Map<string, NormalizedLot>();
-        for (const l of cheap.lots) byId.set(l.id, l);
-        for (const l of expensive.lots) byId.set(l.id, l);
-        return { key, lots: Array.from(byId.values()) };
-      } catch (e) {
-        console.error(`tracker check [${source}] lots failed for ${itemId}:`, e);
-        return { key, lots: [] as NormalizedLot[] };
+  for (const [key, list] of groups) {
+    const [itemId, region] = key.split("|");
+    // До 200 лотов двумя страницами (EAPI отдаёт максимум 100 за запрос)
+    let lots: NormalizedLot[] = [];
+    try {
+      for (const off of [0, 100]) {
+        const r = await fetchLots(itemId, region, 100, off);
+        lots = lots.concat(r.lots);
+        if (r.lots.length < 100) break;
       }
-    })
-  );
-  const lotsByGroup = new Map(groupLotsResults.map((r) => [r.key, r.lots]));
-
-  for (const [key, list] of groupEntries) {
-    const lots = lotsByGroup.get(key) || [];
+    } catch (e) {
+      console.error(`tracker check [${source}] lots failed for ${itemId}:`, e);
+      continue;
+    }
 
     for (const tracker of list) {
       const seen: string[] = Array.isArray(tracker.lastSeenLotIds)

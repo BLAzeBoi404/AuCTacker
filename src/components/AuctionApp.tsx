@@ -45,6 +45,7 @@ interface Lot {
 interface HistEntry {
   id: string;
   price: number;
+  amount: number;
   time: string | null;
   upgrade: number;
   quality: number;
@@ -85,7 +86,6 @@ interface SchedulerInfo {
   lastRun: string | null;
   lastSummary: string | null;
   interval: number;
-  nextRunAt: string | null;
 }
 interface SettingsState {
   scheduler_enabled: string;
@@ -123,13 +123,57 @@ const itemName = (it: Item | null | undefined) =>
 const itemIcon = (it: Item | null | undefined) =>
   it?.iconUrl || it?.icon || FALLBACK_ICON;
 
-async function fetchJson<T>(url: string, opts?: RequestInit): Promise<T> {
-  const r = await fetch(url, { cache: "no-store", ...opts });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json() as Promise<T>;
+async function fetchJson<T>(url: string, opts?: RequestInit, timeoutMs = 20000): Promise<T> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { cache: "no-store", ...opts, signal: ctrl.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return (await r.json()) as T;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Цена за штуку: API отдаёт сумму за весь стак
+function perUnit(price: number, amount: number): number {
+  return amount > 1 ? Math.round(price / amount) : price;
+}
+
+// Ключи localStorage (со старых staltrack_* переезжаем молча)
+const LS_KEYS = {
+  region: ["auctracker_region", "staltrack_region"],
+  sound: ["auctracker_sound", "staltrack_sound"],
+  item: ["auctracker_item", "staltrack_item"],
+  interval: ["auctracker_check_interval", "staltrack_check_interval"],
+} as const;
+type LsKey = keyof typeof LS_KEYS;
+function lsGet(k: LsKey): string | null {
+  try {
+    return localStorage.getItem(LS_KEYS[k][0]) ?? localStorage.getItem(LS_KEYS[k][1]);
+  } catch {
+    return null;
+  }
+}
+function lsSet(k: LsKey, v: string) {
+  try {
+    localStorage.setItem(LS_KEYS[k][0], v);
+    localStorage.removeItem(LS_KEYS[k][1]);
+  } catch {
+    /* ignore */
+  }
 }
 
 const UPGRADE_CHIPS: (number | null)[] = [null, 0, 5, 10, 12, 13, 15];
+
+// Как часто тихонько подтягиваем свежие лоты на открытом экране (истрия — каждый 3-й цикл)
+const LOTS_MS = 30000;
+
+function formatCountdown(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  const m = Math.floor(s / 60);
+  return `${String(m).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
 
 export default function AuctionApp() {
   // ---------- Global state ----------
@@ -139,9 +183,6 @@ export default function AuctionApp() {
   const [mobileMenu, setMobileMenu] = useState(false);
   const [soundOn, setSoundOn] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const AUTO_REFRESH_MS = 30000;
-  const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
-  const [nowTick, setNowTick] = useState(() => Date.now());
 
   // ---------- Item + search ----------
   const [selectedItem, setSelectedItem] = useState<Item>({
@@ -162,14 +203,22 @@ export default function AuctionApp() {
   // ---------- Lots / history ----------
   const [lots, setLots] = useState<Lot[]>([]);
   const [lotsTotal, setLotsTotal] = useState(0);
-  const [lotsLoading, setLotsLoading] = useState(false);
+  const [lotsLoading, setLotsLoading] = useState(true);
   const [history, setHistory] = useState<HistEntry[]>([]);
-  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [activeTab, setActiveTab] = useState<"lots" | "history">("lots");
   const [timeframe, setTimeframe] = useState<"24h" | "7d" | "30d" | "all">("7d");
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
+  // Тихое обновление без мигания скелетонов + обратный отсчёт в футере
+  const [lotsRefreshing, setLotsRefreshing] = useState(false);
+  const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const lotsInflight = useRef(false);
+  const histInflight = useRef(false);
+  const searchSeq = useRef(0);
+  const histCycle = useRef(0);
 
   // ---------- Filters ----------
   const [filterUpgrade, setFilterUpgrade] = useState<number | null>(null);
@@ -187,7 +236,7 @@ export default function AuctionApp() {
     upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1,
     maxPrice: 0, minPrice: 0, enableSound: true, enableBrowser: true,
   });
-  const [checkInterval, setCheckInterval] = useState(60);
+  const [checkInterval, setCheckInterval] = useState(30);
   const [checking, setChecking] = useState(false);
   const [lastCheck, setLastCheck] = useState<Date | null>(null);
 
@@ -207,6 +256,8 @@ export default function AuctionApp() {
   const [catalogCategory, setCatalogCategory] = useState("all");
   const [catalogItems, setCatalogItems] = useState<Item[]>([]);
   const [catalogTotal, setCatalogTotal] = useState(0);
+  const [catalogNeedsSync, setCatalogNeedsSync] = useState(false);
+  const [catalogSyncing, setCatalogSyncing] = useState(false);
   const [catalogPage, setCatalogPage] = useState(1);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [categories, setCategories] = useState<{ category: string; count: number }[]>([]);
@@ -215,11 +266,11 @@ export default function AuctionApp() {
   // ---------- Init ----------
   useEffect(() => {
     try {
-      const r = localStorage.getItem("staltrack_region");
+      const r = lsGet("region");
       if (r) setRegion(r);
-      const s = localStorage.getItem("staltrack_sound");
+      const s = lsGet("sound");
       if (s !== null) setSoundOn(s === "1");
-      const it = localStorage.getItem("staltrack_item");
+      const it = lsGet("item");
       const params = new URLSearchParams(window.location.search);
       const urlItem = params.get("item");
       if (urlItem) {
@@ -233,7 +284,7 @@ export default function AuctionApp() {
           setSearchQuery(itemName(parsed));
         } catch { /* ignore */ }
       }
-      const ci = localStorage.getItem("staltrack_check_interval");
+      const ci = lsGet("interval");
       if (ci) setCheckInterval(Number(ci) || 30);
     } catch { /* ignore */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -258,9 +309,15 @@ export default function AuctionApp() {
   }, []);
 
   // ---------- Fetchers ----------
-  const fetchLots = useCallback(async (itemId: string, reg: string) => {
-    setLotsLoading(true);
-    setApiError(null);
+  // silent=true: тихое фоновое обновление, экран не мигает
+  const fetchLots = useCallback(async (itemId: string, reg: string, silent = false) => {
+    if (lotsInflight.current) return;
+    lotsInflight.current = true;
+    if (silent) setLotsRefreshing(true);
+    else {
+      setLotsLoading(true);
+      setApiError(null);
+    }
     try {
       const d = await fetchJson<{ success: boolean; lots: Lot[]; total: number }>(
         `/api/lots?itemId=${encodeURIComponent(itemId)}&region=${reg}&limit=500`
@@ -268,17 +325,25 @@ export default function AuctionApp() {
       setLots(d.lots || []);
       setLotsTotal(d.total || (d.lots || []).length);
       setLastUpdate(new Date());
+      setNextRefreshAt(Date.now() + LOTS_MS);
     } catch {
-      setLots([]);
-      setLotsTotal(0);
-      setApiError("Не удалось загрузить лоты. API EXBO может быть недоступно — попробуйте обновить.");
+      if (!silent) {
+        setLots([]);
+        setLotsTotal(0);
+        setApiError("Не удалось загрузить лоты. API EXBO может быть недоступно — попробуйте обновить.");
+      }
     } finally {
+      lotsInflight.current = false;
       setLotsLoading(false);
+      setLotsRefreshing(false);
+      setNextRefreshAt(Date.now() + LOTS_MS);
     }
   }, []);
 
-  const fetchHistory = useCallback(async (itemId: string, reg: string) => {
-    setHistoryLoading(true);
+  const fetchHistory = useCallback(async (itemId: string, reg: string, silent = false) => {
+    if (histInflight.current) return;
+    histInflight.current = true;
+    if (!silent) setHistoryLoading(true);
     try {
       const d = await fetchJson<{ success: boolean; history: HistEntry[] }>(
         `/api/history?itemId=${encodeURIComponent(itemId)}&region=${reg}&limit=600`
@@ -286,8 +351,9 @@ export default function AuctionApp() {
       setHistory(d.history || []);
       setHistoryLoaded(true);
     } catch {
-      setHistory([]);
+      if (!silent) setHistory([]);
     } finally {
+      histInflight.current = false;
       setHistoryLoading(false);
     }
   }, []);
@@ -486,48 +552,33 @@ export default function AuctionApp() {
   }, [loadSettings, pushToast]);
 
   const syncItems = useCallback(async () => {
-    pushToast("Синхронизация", "Обновляю базу предметов…");
+    setCatalogSyncing(true);
+    pushToast("Синхронизация", "Качаю базу предметов с GitHub… это до пары минут на холодном Neon.");
     try {
-      const d = await fetchJson<{ success: boolean; count?: number }>("/api/items/sync", { method: "POST" });
+      // Синхронизации даём 2 минуты: холодная база просыпается несколько секунд
+      const d = await fetchJson<{ success: boolean; count?: number }>(
+        "/api/items/sync",
+        { method: "POST" },
+        120000
+      );
       if (d.success) {
+        setCatalogNeedsSync(false);
         pushToast("Готово", `Предметов в базе: ${d.count}`);
-        if (view === "catalog") loadCatalog(catalogQuery, catalogCategory, 1);
+        setCatalogPage(1);
+        loadCatalog(catalogQuery, catalogCategory, 1);
       } else {
-        pushToast("Ошибка", "Не удалось обновить базу.");
+        pushToast("Ошибка", "Не удалось обновить базу. Подождите минуту и попробуйте ещё раз.");
       }
     } catch {
-      pushToast("Ошибка", "Не удалось обновить базу.");
+      pushToast("Ошибка", "Не удалось обновить базу. Подождите минуту и попробуйте ещё раз.");
+    } finally {
+      setCatalogSyncing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pushToast, view, catalogQuery, catalogCategory]);
+  }, [pushToast, catalogQuery, catalogCategory]);
 
   useEffect(() => {
     if (view === "settings") loadSettings();
-  }, [view, loadSettings]);
-
-  // Держим статус фонового планировщика свежим для живого счётчика в футере.
-  // Важно: НЕ опрашиваем сервер каждые несколько секунд — на бесплатном
-  // Neon это не даёт базе "заснуть" и сжигает лимит CU-часов. Вместо этого
-  // локальный счётчик просто тикает (см. nowTick), а сервер спрашиваем один
-  // раз, когда обратный отсчёт истёк (плюс небольшая пауза, чтобы сервер
-  // успел завершить проверку), и при возврате на вкладку.
-  const settingsRefetchLock = useRef(false);
-  useEffect(() => {
-    if (!scheduler?.nextRunAt) return;
-    const msLeft = new Date(scheduler.nextRunAt).getTime() - nowTick;
-    if (msLeft > -2000 || settingsRefetchLock.current) return;
-    settingsRefetchLock.current = true;
-    loadSettings().finally(() => {
-      setTimeout(() => { settingsRefetchLock.current = false; }, 3000);
-    });
-  }, [nowTick, scheduler?.nextRunAt, loadSettings]);
-
-  useEffect(() => {
-    const onVisible = () => {
-      if (typeof document !== "undefined" && !document.hidden && view === "settings") loadSettings();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
   }, [view, loadSettings]);
 
   useEffect(() => {
@@ -548,11 +599,12 @@ export default function AuctionApp() {
     setCatalogLoading(true);
     try {
       const off = (pg - 1) * catalogPerPage;
-      const d = await fetchJson<{ success: boolean; items: Item[]; total: number; categories: { category: string; count: number }[] }>(
+      const d = await fetchJson<{ success: boolean; items: Item[]; total: number; needsSync?: boolean; categories: { category: string; count: number }[] }>(
         `/api/items?q=${encodeURIComponent(q)}&category=${encodeURIComponent(cat)}&limit=${catalogPerPage}&offset=${off}`
       );
       setCatalogItems(d.items || []);
       setCatalogTotal(d.total || 0);
+      setCatalogNeedsSync(!!d.needsSync && (d.total || 0) === 0);
       if (d.categories?.length) setCategories(d.categories);
     } catch {
       setCatalogItems([]);
@@ -573,12 +625,6 @@ export default function AuctionApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedItem?.id, region]);
 
-  // Тикающие часы для живого счётчика в футере ("обновление через Xс")
-  useEffect(() => {
-    const t = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
-
   useEffect(() => {
     loadTrackers();
     loadNotifications();
@@ -592,48 +638,68 @@ export default function AuctionApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, catalogCategory, catalogPage]);
 
-  // Авторефреш лотов: тикает каждые 30 сек, пока вкладка открыта и видна.
-  // Пока вкладка свёрнута — обновление ставится на паузу (экономим запросы),
-  // а как только пользователь возвращается — сайт сразу подтягивает свежие данные.
+  // Живой тикер для обратного отсчёта (тикает только на экране аукциона)
   useEffect(() => {
-    if (!autoRefresh || view !== "auction" || !selectedItem?.id) {
-      setNextRefreshAt(null);
-      return;
-    }
-    let cancelled = false;
-    const itemId = selectedItem.id;
-    const doRefresh = async () => {
-      if (typeof document !== "undefined" && document.hidden) return;
-      await fetchLots(itemId, region);
-      if (historyLoaded) await fetchHistory(itemId, region);
-      if (!cancelled) setNextRefreshAt(Date.now() + AUTO_REFRESH_MS);
+    if (view !== "auction" || !autoRefresh) return;
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [view, autoRefresh]);
+
+  // Автообновление: лоты каждые 30 сек, история — каждый 3-й цикл (раз в ~90 сек)
+  useEffect(() => {
+    if (!autoRefresh || view !== "auction" || !selectedItem?.id) return;
+    histCycle.current = 0;
+    const tick = () => {
+      if (!selectedItem?.id) return;
+      fetchLots(selectedItem.id, region, true);
+      histCycle.current += 1;
+      if (historyLoaded && histCycle.current % 3 === 0) {
+        fetchHistory(selectedItem.id, region, true);
+      }
     };
-    setNextRefreshAt(Date.now() + AUTO_REFRESH_MS);
-    const t = setInterval(doRefresh, AUTO_REFRESH_MS);
-    const onVisible = () => {
-      if (typeof document !== "undefined" && !document.hidden) doRefresh();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
+    const t = setInterval(tick, LOTS_MS);
+    return () => clearInterval(t);
   }, [autoRefresh, view, selectedItem?.id, region, historyLoaded, fetchLots, fetchHistory]);
+
+  // Вернулись на вкладку — сразу подтягиваем свежее, если пора
+  useEffect(() => {
+    const onReturn = () => {
+      if (
+        document.visibilityState !== "visible" ||
+        !autoRefresh ||
+        view !== "auction" ||
+        !selectedItem?.id
+      )
+        return;
+      setNowMs(Date.now());
+      if (!nextRefreshAt || Date.now() >= nextRefreshAt - 5000) {
+        fetchLots(selectedItem.id, region, true);
+        if (historyLoaded) fetchHistory(selectedItem.id, region, true);
+      }
+    };
+    document.addEventListener("visibilitychange", onReturn);
+    window.addEventListener("focus", onReturn);
+    return () => {
+      document.removeEventListener("visibilitychange", onReturn);
+      window.removeEventListener("focus", onReturn);
+    };
+  }, [autoRefresh, view, selectedItem?.id, region, historyLoaded, nextRefreshAt, fetchLots, fetchHistory]);
 
   // ---------- Поиск ----------
   const doSearch = useCallback(async (q: string) => {
+    const seq = ++searchSeq.current;
     setSearchLoading(true);
     try {
       const d = await fetchJson<{ success: boolean; items: Item[]; total: number }>(
         `/api/items?q=${encodeURIComponent(q)}&limit=12`
       );
+      if (searchSeq.current !== seq) return; // пришёл более свежий запрос — этот выбрасываем
       setSearchResults(d.items || []);
       setSearchTotal(d.total || 0);
     } catch {
-      setSearchResults([]);
+      if (searchSeq.current === seq) setSearchResults([]);
     } finally {
-      setSearchLoading(false);
+      if (searchSeq.current === seq) setSearchLoading(false);
     }
   }, []);
 
@@ -656,7 +722,7 @@ export default function AuctionApp() {
     setHistoryPage(1);
     setView("auction");
     try {
-      localStorage.setItem("staltrack_item", JSON.stringify(item));
+      lsSet("item", JSON.stringify(item));
       const url = new URL(window.location.href);
       url.searchParams.set("item", item.id);
       window.history.replaceState({}, "", url.toString());
@@ -720,20 +786,8 @@ export default function AuctionApp() {
 
   useEffect(() => {
     if (trackers.filter((t) => t.enabled).length === 0) return;
-    const t = setInterval(() => {
-      // В свёрнутой вкладке не дёргаем API — фоновый планировщик сервера
-      // и так продолжает проверять трекеры и слать уведомления в Telegram.
-      if (typeof document !== "undefined" && document.hidden) return;
-      checkTrackers(true);
-    }, checkInterval * 1000);
-    const onVisible = () => {
-      if (typeof document !== "undefined" && !document.hidden) checkTrackers(true);
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      clearInterval(t);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
+    const t = setInterval(() => checkTrackers(true), checkInterval * 1000);
+    return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [checkInterval, trackers.length]);
 
@@ -794,7 +848,9 @@ export default function AuctionApp() {
 
   // ---------- Derived ----------
   const stats = useMemo(() => {
-    const prices = lots.map((l) => l.buyoutPrice || l.startPrice).filter((p) => p > 0);
+    const prices = lots
+      .map((l) => perUnit(l.buyoutPrice || l.startPrice, l.amount))
+      .filter((p) => p > 0);
     if (!prices.length) return { min: 0, max: 0, avg: 0 };
     return {
       min: Math.min(...prices),
@@ -804,16 +860,18 @@ export default function AuctionApp() {
   }, [lots]);
 
   const histStats = useMemo(() => {
-    const prices = history.map((h) => h.price).filter((p) => p > 0);
-    const last = history.find((h) => h.price > 0)?.price || 0;
+    const unit = (h: HistEntry) => perUnit(h.price, h.amount || 1);
+    const prices = history.map(unit).filter((p) => p > 0);
+    const lastEntry = history.find((h) => h.price > 0);
+    const last = lastEntry ? unit(lastEntry) : 0;
     if (!prices.length) return { last, min: 0, max: 0, avg: 0, count: history.length, change: 0 };
     const now = Date.now();
-    const last24 = history.filter((h) => h.time && now - new Date(h.time).getTime() < 86400000).map((h) => h.price).filter((p) => p > 0);
+    const last24 = history.filter((h) => h.time && now - new Date(h.time).getTime() < 86400000).map(unit).filter((p) => p > 0);
     const prev24 = history.filter((h) => {
       if (!h.time) return false;
       const d = now - new Date(h.time).getTime();
       return d >= 86400000 && d < 172800000;
-    }).map((h) => h.price).filter((p) => p > 0);
+    }).map(unit).filter((p) => p > 0);
     const avg = (a: number[]) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
     const a24 = avg(last24), ap = avg(prev24);
     const change = ap > 0 ? ((a24 - ap) / ap) * 100 : 0;
@@ -831,9 +889,8 @@ export default function AuctionApp() {
     const now = Date.now();
     const ms = timeframe === "24h" ? 86400000 : timeframe === "7d" ? 7 * 86400000 : timeframe === "30d" ? 30 * 86400000 : Infinity;
     return history
-      .filter((h) => h.price > 0 && (!h.time || now - new Date(h.time).getTime() < ms))
-      .map((h) => ({ time: h.time, price: h.price }))
-      .sort((a, b) => (a.time ? new Date(a.time).getTime() : 0) - (b.time ? new Date(b.time).getTime() : 0));
+      .filter((h) => h.price > 0 && h.time && now - new Date(h.time).getTime() < ms)
+      .map((h) => ({ time: h.time, price: perUnit(h.price, h.amount || 1) }));
   }, [history, timeframe]);
 
   const processedLots = useMemo(() => {
@@ -874,20 +931,6 @@ export default function AuctionApp() {
       : { icon: TrendingDown, cls: "text-red-400 bg-red-500/10", txt: `${histStats.change}%` };
 
   const regionLabel = REGIONS.find((r) => r.id === region)?.label || region;
-
-  // Живой обратный отсчёт для футера: приоритет — обновление лотов на
-  // открытой странице аукциона, иначе — ближайшая фоновая проверка сервера.
-  const footerCountdown = useMemo(() => {
-    if (nextRefreshAt) {
-      const secs = Math.max(0, Math.round((nextRefreshAt - nowTick) / 1000));
-      return { label: "Обновление аукциона через", secs };
-    }
-    if (scheduler?.enabled && scheduler.nextRunAt) {
-      const secs = Math.max(0, Math.round((new Date(scheduler.nextRunAt).getTime() - nowTick) / 1000));
-      return { label: "Следующая фоновая проверка через", secs };
-    }
-    return null;
-  }, [nextRefreshAt, nowTick, scheduler]);
 
   // ================= RENDER =================
   return (
@@ -944,7 +987,7 @@ export default function AuctionApp() {
                       key={r.id}
                       onClick={() => {
                         setRegion(r.id);
-                        try { localStorage.setItem("staltrack_region", r.id); } catch { /* ignore */ }
+                        lsSet("region", r.id);
                         setRegionOpen(false);
                       }}
                       className={`flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] hover:bg-zinc-800 ${region === r.id ? "text-[#d4ff3f]" : "text-zinc-300"}`}
@@ -958,7 +1001,7 @@ export default function AuctionApp() {
             </div>
 
             <button
-              onClick={() => { setSoundOn((v) => { try { localStorage.setItem("staltrack_sound", !v ? "1" : "0"); } catch { /* ignore */ } return !v; }); }}
+              onClick={() => { setSoundOn((v) => { lsSet("sound", !v ? "1" : "0"); return !v; }); }}
               title={soundOn ? "Выключить звук" : "Включить звук"}
               className="hidden rounded-lg border border-zinc-800 bg-zinc-900/60 p-2 text-zinc-400 hover:text-white sm:block"
             >
@@ -1066,12 +1109,18 @@ export default function AuctionApp() {
               <span>›</span>
               <span className="text-zinc-300">{itemName(selectedItem)}</span>
               <span className="ml-auto flex items-center gap-2">
+                {autoRefresh && (
+                  <span className="flex items-center gap-1.5 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-300">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 live-dot" /> LIVE
+                  </span>
+                )}
                 {lastUpdate && <span className="text-[11px]">обновлено {timeAgo(lastUpdate)}</span>}
                 <button
-                  onClick={() => { if (selectedItem) { fetchLots(selectedItem.id, region); fetchHistory(selectedItem.id, region); } }}
-                  className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900/60 px-2.5 py-1 text-[12px] text-zinc-300 hover:border-zinc-700"
+                  onClick={() => { if (selectedItem) { fetchLots(selectedItem.id, region, true); fetchHistory(selectedItem.id, region, true); } }}
+                  disabled={lotsRefreshing}
+                  className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900/60 px-2.5 py-1 text-[12px] text-zinc-300 hover:border-zinc-700 disabled:opacity-60"
                 >
-                  <RefreshCw className={`h-3 w-3 ${lotsLoading ? "animate-spin" : ""}`} /> Обновить
+                  <RefreshCw className={`h-3 w-3 ${lotsRefreshing ? "animate-spin" : ""}`} /> Обновить
                 </button>
               </span>
             </div>
@@ -1147,8 +1196,8 @@ export default function AuctionApp() {
               {[
                 { label: "Последняя за шт.", value: histStats.last, cls: "text-white", icon: HistoryIcon },
                 { label: "Средняя за шт.", value: histStats.avg, cls: "text-sky-400", icon: BarChart3 },
-                { label: "Минимум за шт.", value: stats.min || histStats.min, cls: "text-emerald-400", icon: ArrowDown },
-                { label: "Максимум за шт.", value: stats.max || histStats.max, cls: "text-red-400", icon: ArrowUp },
+                { label: "Минимум за шт.", value: histStats.min || stats.min, cls: "text-emerald-400", icon: ArrowDown },
+                { label: "Максимум за шт.", value: histStats.max || stats.max, cls: "text-red-400", icon: ArrowUp },
                 { label: "Продаж", value: histStats.count, cls: "text-white", raw: true, icon: ShoppingBag },
               ].map((s: { label: string; value: number; cls: string; raw?: boolean; icon: LucideIcon }) => (
                 <div key={s.label} className="rounded-2xl border border-zinc-800/80 bg-[#101013] p-4 text-center transition hover:border-zinc-700">
@@ -1187,7 +1236,7 @@ export default function AuctionApp() {
                 {historyLoading ? (
                   <div className="skeleton h-[240px] rounded-xl" />
                 ) : (
-                  <PriceChart data={chartData} referenceMax={stats.max} />
+                  <PriceChart data={chartData} />
                 )}
               </div>
             </div>
@@ -1215,7 +1264,7 @@ export default function AuctionApp() {
                 >
                   <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${autoRefresh ? "left-[18px]" : "left-0.5"}`} />
                 </button>
-                Автообновление 60с
+                Автообновление · каждые 30с
               </label>
             </div>
 
@@ -1454,9 +1503,27 @@ export default function AuctionApp() {
                     {Array.from({ length: 12 }).map((_, i) => <div key={i} className="skeleton h-20 rounded-xl" />)}
                   </div>
                 ) : catalogItems.length === 0 ? (
-                  <div className="mt-3 rounded-2xl border border-zinc-800 bg-[#101013] p-10 text-center text-[13px] text-zinc-500">
-                    Ничего не найдено. Попробуйте другой запрос.
-                  </div>
+                  catalogNeedsSync && !catalogQuery ? (
+                    <div className="mt-3 rounded-2xl border border-[#d4ff3f]/25 bg-[#101013] p-10 text-center anim-fade-up">
+                      <Database className="mx-auto h-8 w-8 text-[#d4ff3f]" />
+                      <p className="mt-3 text-[15px] font-semibold text-white">База предметов ещё пустая</p>
+                      <p className="mx-auto mt-1 max-w-md text-[13px] leading-relaxed text-zinc-500">
+                        На свежей базе каталог подтягивается с GitHub один раз — это до пары минут.
+                        Нажмите кнопку и подождите, больше ничего делать не надо.
+                      </p>
+                      <button
+                        onClick={syncItems}
+                        disabled={catalogSyncing}
+                        className="mt-4 rounded-xl bg-[#d4ff3f] px-5 py-2.5 text-[13px] font-bold text-black hover:brightness-110 disabled:opacity-50"
+                      >
+                        {catalogSyncing ? "Загружаю… подождите" : "Загрузить базу предметов"}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="mt-3 rounded-2xl border border-zinc-800 bg-[#101013] p-10 text-center text-[13px] text-zinc-500">
+                      Ничего не найдено. Попробуйте другой запрос.
+                    </div>
+                  )
                 ) : (
                   <>
                     <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-4">
@@ -1520,14 +1587,14 @@ export default function AuctionApp() {
               <div className="ml-auto flex flex-wrap items-center gap-2">
                 <select
                   value={checkInterval}
-                  onChange={(e) => { const v = Number(e.target.value); setCheckInterval(v); try { localStorage.setItem("staltrack_check_interval", String(v)); } catch { /* ignore */ } }}
+                  onChange={(e) => { const v = Number(e.target.value); setCheckInterval(v); lsSet("interval", String(v)); }}
                   className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-2 text-[12.5px] text-zinc-200 outline-none"
-                  title="Интервал автопроверки (только пока эта вкладка открыта)"
+                  title="Интервал автопроверки"
                 >
-                  <option value={30}>Каждые 30 сек — часто, только для своей БД</option>
+                  <option value={15}>Каждые 15 сек</option>
+                  <option value={30}>Каждые 30 сек</option>
                   <option value={60}>Каждую минуту</option>
-                  <option value={120}>Каждые 2 мин — рекомендуется</option>
-                  <option value={300}>Каждые 5 мин — экономно</option>
+                  <option value={120}>Каждые 2 мин</option>
                 </select>
                 <button
                   onClick={() => checkTrackers(false)}
@@ -1545,11 +1612,6 @@ export default function AuctionApp() {
                 </button>
               </div>
             </div>
-            <p className="mt-1.5 text-[11px] text-zinc-600">
-              Интервал выше ускоряет проверку только пока эта вкладка открыта в браузере (плюс звук и пуш на
-              компьютере). Уведомления в Telegram работают отдельно и постоянно — их частота настраивается в
-              разделе «Настройки → Фоновый трекинг».
-            </p>
 
             {notifPermission !== "granted" && (
               <div className="mt-4 flex flex-wrap items-center gap-3 rounded-2xl border border-[#d4ff3f]/20 bg-[#d4ff3f]/5 p-4">
@@ -1676,8 +1738,7 @@ export default function AuctionApp() {
                   )}
                 </div>
                 <p className="mt-1 text-[12.5px] leading-relaxed text-zinc-500">
-                  Настройте один раз — и уведомления будут приходить в Telegram даже с выключенным компьютером
-                  и закрытым сайтом. Каждый друг привязывает свой Telegram отдельно, своим личным кодом.
+                  Уведомления приходят в Telegram, даже когда сайт закрыт. Каждый друг привязывает свой аккаунт отдельно — своим кодом.
                 </p>
 
                 {settings?.telegram_has_token !== "1" ? (
@@ -1700,30 +1761,21 @@ export default function AuctionApp() {
                         {tgBusy ? "…" : "Подключить"}
                       </button>
                     </div>
-                    <details open className="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 py-2.5">
-                      <summary className="flex items-center gap-1.5 text-[12.5px] font-semibold text-zinc-200">
-                        <ChevronDown className="h-3.5 w-3.5" /> Шаг 1. Создайте своего бота (займёт 2 минуты)
+                    <details className="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 py-2">
+                      <summary className="flex items-center gap-1.5 text-[12.5px] font-medium text-zinc-300">
+                        <ChevronDown className="h-3.5 w-3.5" /> Как создать бота — по шагам
                       </summary>
-                      <ol className="mt-2.5 list-decimal space-y-2 pl-5 text-[12.5px] leading-relaxed text-zinc-400">
-                        <li>
-                          В Telegram найдите через поиск аккаунт <b className="text-zinc-200">@BotFather</b>
-                          (это официальный бот Telegram для создания ботов) и откройте с ним чат.
-                        </li>
-                        <li>
-                          Отправьте ему команду <code className="mono rounded bg-zinc-800 px-1.5 py-0.5">/newbot</code>
-                        </li>
-                        <li>
-                          Он спросит имя бота — напишите любое, например <span className="text-zinc-300">Мой аукцион</span>.
-                          Затем спросит username — он обязательно должен заканчиваться на <code className="mono rounded bg-zinc-800 px-1.5 py-0.5">bot</code>,
-                          например <span className="text-zinc-300">my_auction_bot</span>.
-                        </li>
-                        <li>
-                          BotFather пришлёт сообщение с токеном — длинной строкой вида
-                          <code className="mono ml-1 rounded bg-zinc-800 px-1.5 py-0.5">7123456789:AAH1a2B3c4D5e6F7g8H9</code>.
-                          Скопируйте её целиком.
-                        </li>
-                        <li>Вставьте скопированный токен в поле выше и нажмите кнопку «Подключить».</li>
+                      <ol className="mt-2 list-decimal space-y-1.5 pl-5 text-[12px] leading-relaxed text-zinc-400">
+                        <li>В Telegram найдите <b className="text-zinc-200">@BotFather</b> (официальный, с галочкой) и нажмите Start.</li>
+                        <li>Отправьте ему <code className="mono rounded bg-zinc-800 px-1">/newbot</code>.</li>
+                        <li>Он попросит имя — введите любое, например <b className="text-zinc-200">AucTracker</b>.</li>
+                        <li>Потом попросит username — только латиница, в конце обязательно <b className="text-zinc-200">bot</b>, например <b className="text-zinc-200">auctracker_alerts_bot</b>. Если занят — добавьте цифры.</li>
+                        <li>BotFather пришлёт токен вида <code className="mono rounded bg-zinc-800 px-1">123456:AAH…</code> — скопируйте его целиком, от начала до конца.</li>
+                        <li>Вставьте токен в поле выше и нажмите «Подключить». Если ниже появился @вашего бота — всё получилось.</li>
                       </ol>
+                      <p className="mt-2 rounded-lg bg-zinc-950/60 px-2.5 py-1.5 text-[11.5px] text-zinc-500">
+                        Не подключается? Чаще всего токен скопирован не полностью. Удалите и вставьте заново — или создайте нового бота через /newbot.
+                      </p>
                     </details>
                   </div>
                 ) : (
@@ -1748,15 +1800,17 @@ export default function AuctionApp() {
                     </div>
 
                     <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
-                      <p className="text-[12px] font-semibold text-zinc-200">Шаг 2. Привяжите свой Telegram-аккаунт</p>
-                      <ol className="mt-1.5 list-decimal space-y-1 pl-5 text-[11.5px] leading-relaxed text-zinc-500">
-                        <li>Нажмите кнопку «Получить код» ниже — появится код из 6 символов.</li>
-                        <li>Нажмите «Открыть бота» (или найдите бота в Telegram по имени вручную).</li>
-                        <li>В чате с ботом нажмите кнопку <b className="text-zinc-300">Start</b> — код подставится автоматически.</li>
-                        <li>Готово — бот пришлёт подтверждение. Каждый друг повторяет эти же 3 шага под своим кодом.</li>
+                      <p className="text-[12px] font-medium text-zinc-300">Как подключить свой Telegram</p>
+                      <p className="mt-0.5 text-[11.5px] leading-relaxed text-zinc-500">
+                        Каждому человеку нужен свой код — делать это надо один раз. Код одноразовый и сгорает через 15 минут.
+                      </p>
+                      <ol className="mt-1.5 list-decimal space-y-1 pl-5 text-[11.5px] leading-relaxed text-zinc-400">
+                        <li>Нажмите «Получить код» — появится код из 6 букв и ссылка.</li>
+                        <li>Нажмите «Открыть бота» и там кнопку Start. Если боту уже писали Start раньше — просто отправьте ему сообщение вида <code className="mono rounded bg-zinc-800 px-1">/start ВАШКОД</code>.</li>
+                        <li>Вернитесь сюда и нажмите «Проверить привязку» — человек появится в списке ниже.</li>
+                        <li>Для друга нажмите «Получить код» ещё раз — у него будет свой.</li>
                       </ol>
-                      <p className="mt-1.5 text-[11px] text-zinc-600">Код действует 15 минут. Не открылось автоматически — нажмите «Проверить привязку».</p>
-                      <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
                         <button
                           onClick={genLinkCode}
                           disabled={tgBusy}
@@ -1847,13 +1901,8 @@ export default function AuctionApp() {
                   )}
                 </div>
                 <p className="mt-1 text-[12.5px] leading-relaxed text-zinc-500">
-                  Пока сервер запущен, он сам, без вашего участия, заходит на аукцион по расписанию, сверяет
-                  цены со всеми трекерами и шлёт находки в Telegram. Держать сайт открытым в браузере не нужно.
-                </p>
-                <p className="mt-1.5 text-[11.5px] text-zinc-600">
-                  {scheduler?.lastRun
-                    ? `Последняя проверка: ${timeAgo(scheduler.lastRun)}${scheduler.lastSummary ? ` — ${scheduler.lastSummary}` : ""}.`
-                    : "Проверок пока не было — первая запустится в течение минуты после запуска сайта."}
+                  Сервер сам проверяет трекеры и шлёт уведомления в Telegram — сайт держать открытым не нужно.
+                  {scheduler?.lastRun ? ` Последняя проверка: ${timeAgo(scheduler.lastRun)}${scheduler.lastSummary ? ` (${scheduler.lastSummary})` : ""}.` : " Пока ни одной проверки."}
                 </p>
 
                 <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -1866,53 +1915,44 @@ export default function AuctionApp() {
                   </button>
                   <span className="text-[12.5px] text-zinc-300">Проверять каждые</span>
                   <select
-                    value={settings?.scheduler_interval || "600"}
+                    value={settings?.scheduler_interval || "60"}
                     onChange={(e) => saveSettings({ scheduler_interval: e.target.value }, "Интервал обновлён")}
                     className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-[12.5px] text-zinc-200 outline-none"
                   >
-                    <option value="60">1 мин — только для своей БД (не Neon free)</option>
-                    <option value="120">2 мин — не для Neon free</option>
-                    <option value="300">5 мин — впритык для Neon free</option>
-                    <option value="600">10 мин — рекомендуется для Neon free ✓</option>
-                    <option value="900">15 минут — с запасом</option>
-                    <option value="1800">30 минут — экономно</option>
+                    <option value="15">15 сек (только свой ПК — жрёт лимит Neon)</option>
+                    <option value="30">30 сек (только свой ПК — жрёт лимит Neon)</option>
+                    <option value="60">1 мин</option>
+                    <option value="120">2 мин</option>
+                    <option value="180">3 мин — советую для Neon Free</option>
+                    <option value="300">5 мин — советую для Neon Free</option>
+                    <option value="600">10 мин</option>
                   </select>
                 </div>
-                <div className="mt-3 rounded-xl border border-sky-500/20 bg-sky-500/[0.04] p-3">
-                  <p className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-200">
-                    <Database className="h-3.5 w-3.5 text-sky-400" /> Хватит ли бесплатного Neon (0.5 ГБ / 100 CU-часов)?
+                {(settings?.scheduler_interval === "15" || settings?.scheduler_interval === "30") && (
+                  <p className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
+                    Такой частый опрос не даёт базе Neon уснуть и съест 100 CU-hrs примерно
+                    к середине месяца. Для бесплатного Neon ставь 3–5 минут — лоты висят
+                    часами, ничего не убежит.
                   </p>
-                  <p className="mt-1.5 text-[11.5px] leading-relaxed text-zinc-500">
-                    <b className="text-zinc-300">Место на диске — да, с большим запасом:</b> вся база (каталог ~2500 предметов,
-                    трекеры, уведомления) весит пару мегабайт из доступных 500. <br />
-                    <b className="text-zinc-300">Компьютер-часы — единственное, что нужно контролировать:</b> Neon
-                    «замораживает» базу через 5 минут без запросов, и это правило нельзя отключить на бесплатном
-                    тарифе. Если проверять чаще, чем раз в 5 минут, база вообще не будет засыпать и лимит в 100
-                    часов кончится примерно за 2–3 недели вместо месяца. При интервале <b className="text-zinc-300">10 минут</b> база
-                    успевает поспать между проверками, и расход составляет примерно <b className="text-zinc-300">60–90 CU-часов
-                    в месяц</b> для 4–5 человек — укладывается с запасом. Именно поэтому 10 минут выбраны по умолчанию.
-                  </p>
-                  <p className="mt-1.5 text-[11px] text-zinc-600">
-                    Если лимит всё же закончится раньше конца месяца — Neon просто приостановит базу до следующего
-                    месяца (данные не удаляются). Увеличьте интервал до 15–30 минут, и в следующем месяце лимита
-                    хватит с запасом.
-                  </p>
-                </div>
+                )}
 
                 <div className="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
-                  <p className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-200">
-                    <KeyRound className="h-3.5 w-3.5 text-zinc-500" /> Если сайт на бесплатном хостинге — добавьте "будильник"
+                  <p className="flex items-center gap-1.5 text-[12px] font-medium text-zinc-300">
+                    <KeyRound className="h-3.5 w-3.5 text-zinc-500" /> Внешний cron-пинг (для бесплатного хостинга)
                   </p>
-                  <p className="mt-1 text-[11.5px] leading-relaxed text-zinc-500">
-                    Бесплатные тарифы хостингов (Render и похожие) "засыпают" через 10–15 минут без посетителей —
-                    тогда планировщик выше тоже останавливается. Чтобы сайт не засыпал и проверка не прерывалась,
-                    настройте бесплатный сервис, который сам заходит по ссылке ниже каждые несколько минут:
+                  <p className="mt-0.5 text-[11.5px] leading-relaxed text-zinc-500">
+                    Зачем это нужно: сайт на бесплатном хостинге засыпает, когда его никто не открывает. Этот адрес его будит и запускает проверку трекеров. Настраивается один раз за 5 минут:
                   </p>
-                  <ol className="mt-2 list-decimal space-y-1.5 pl-5 text-[12px] leading-relaxed text-zinc-400">
-                    <li>Скопируйте ссылку ниже кнопкой справа.</li>
-                    <li>Зайдите на <b className="text-zinc-200">cron-job.org</b> (бесплатно, регистрация по email).</li>
-                    <li>Create cronjob → вставьте ссылку в поле URL → интервал «Every 10 minutes» (совпадает с интервалом проверки выше) → Save.</li>
+                  <ol className="mt-1.5 list-decimal space-y-1 pl-5 text-[11.5px] leading-relaxed text-zinc-400">
+                    <li>Зарегистрируйтесь на <b className="text-zinc-200">cron-job.org</b> (бесплатно) и войдите.</li>
+                    <li>Нажмите <b className="text-zinc-200">Create cronjob</b>.</li>
+                    <li>В поле <b className="text-zinc-200">Title</b> напишите что угодно, например auctracker.</li>
+                    <li>В поле <b className="text-zinc-200">Address (URL)</b> вставьте адрес из строки ниже — целиком, вместе с secret.</li>
+                    <li>В расписании поставьте <b className="text-zinc-200">каждые 2–3 минуты</b> и сохраните.</li>
                   </ol>
+                  <p className="mt-1.5 text-[11.5px] text-zinc-500">
+                    Как понять, что работает: строка «Последняя проверка» выше обновляется каждые пару минут, даже когда сайт закрыт.
+                  </p>
                   <div className="mt-2 flex gap-2">
                     <code className="mono min-w-0 flex-1 truncate rounded-lg border border-zinc-800 bg-zinc-950 px-2.5 py-2 text-[11px] text-zinc-400">
                       {cronUrl || "Загрузка…"}
@@ -1920,63 +1960,21 @@ export default function AuctionApp() {
                     <button onClick={() => cronUrl && copyText(cronUrl, "URL скопирован")} className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 p-2 text-zinc-300 hover:text-white" title="Скопировать URL">
                       <Copy className="h-3.5 w-3.5" />
                     </button>
-                    <button onClick={regenCron} className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 p-2 text-zinc-300 hover:text-white" title="Если ссылка попала не в те руки — создать новую">
+                    <button onClick={regenCron} className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 p-2 text-zinc-300 hover:text-white" title="Новый секрет">
                       <RefreshCw className="h-3.5 w-3.5" />
                     </button>
                   </div>
-                  <p className="mt-1.5 text-[11px] text-zinc-600">
-                    Ссылка содержит секретный код доступа — не выкладывайте её публично. Если это всё же случилось,
-                    нажмите кнопку обновления рядом и впишите новую ссылку в cron-job.org.
-                  </p>
-                  <details className="mt-2.5 rounded-lg bg-zinc-950/60 px-3 py-2.5">
-                    <summary className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-200">
-                      <ChevronDown className="h-3.5 w-3.5" /> Ещё не разместили сайт? Пошагово — бесплатно, без карты, ~20 минут
+                  <details className="mt-2 rounded-lg bg-zinc-950/60 px-3 py-2">
+                    <summary className="flex items-center gap-1.5 text-[12px] font-medium text-zinc-300">
+                      <ChevronDown className="h-3.5 w-3.5" /> Бесплатный хостинг 24/7 за 10 минут
                     </summary>
-                    <ol className="mt-2.5 list-decimal space-y-3 pl-5 text-[12px] leading-relaxed text-zinc-400">
-                      <li>
-                        <b className="text-zinc-200">База данных на Neon.</b> На <b className="text-zinc-200">neon.tech</b> создайте
-                        проект (это уже сделано, если вы видите этот сайт). В разделе Connection Details скопируйте
-                        строку вида <code className="mono rounded bg-zinc-800 px-1">postgresql://...</code> — это ваш будущий{" "}
-                        <code className="mono rounded bg-zinc-800 px-1">DATABASE_URL</code>. Таблицы создавать вручную не нужно —
-                        сайт создаст их сам при первом запуске.
-                      </li>
-                      <li>
-                        <b className="text-zinc-200">Код на GitHub.</b> Откройте проект в VS Code → вкладка «Терминал» → по очереди:
-                        <div className="mono mt-1.5 space-y-1 rounded-lg border border-zinc-800 bg-zinc-950 p-2.5 text-[11px] text-zinc-300">
-                          <div>git init</div>
-                          <div>git add .</div>
-                          <div>git commit -m &quot;Первая версия сайта&quot;</div>
-                          <div>git branch -M main</div>
-                          <div>git remote add origin https://github.com/ВАШ_НИК/НАЗВАНИЕ_РЕПО.git</div>
-                          <div>git push -u origin main</div>
-                        </div>
-                        Ссылку для строки с <code className="mono rounded bg-zinc-800 px-1">remote add</code> берут на github.com:
-                        зелёная кнопка «New» → придумайте имя репозитория → Create repository → скопируйте ссылку сверху страницы.
-                        Файл <code className="mono rounded bg-zinc-800 px-1">.env</code> с паролями в GitHub не попадёт — он уже в .gitignore.
-                      </li>
-                      <li>
-                        <b className="text-zinc-200">Сайт на Render.</b> На <b className="text-zinc-200">render.com</b> → New →
-                        Web Service → «Build and deploy from a Git repository» → выберите свой репозиторий (если не виден —
-                        нажмите «Configure account» и разрешите доступ к нему). Build Command:{" "}
-                        <code className="mono rounded bg-zinc-800 px-1">npm install && npm run build</code>, Start Command:{" "}
-                        <code className="mono rounded bg-zinc-800 px-1">npm start</code>, Instance Type: Free.
-                      </li>
-                      <li>
-                        Перед первым Deploy откройте вкладку Environment и добавьте переменные:{" "}
-                        <code className="mono rounded bg-zinc-800 px-1">DATABASE_URL</code> (строка из шага 1),{" "}
-                        <code className="mono rounded bg-zinc-800 px-1">EXBO_CLIENT_ID</code> = 4062,{" "}
-                        <code className="mono rounded bg-zinc-800 px-1">EXBO_CLIENT_SECRET</code> = bcoEmyJYSCDarPliHZ0SNOkZscVDCkP0twxPwfLU
-                        → Create Web Service. Первая сборка займёт 3–5 минут.
-                      </li>
-                      <li>
-                        Когда сайт откроется по адресу вида <code className="mono rounded bg-zinc-800 px-1">https://ваш-сайт.onrender.com</code>,
-                        настройте cron-job.org, как описано выше (иначе Render уснёт через 15 минут без посетителей).
-                      </li>
-                      <li>Вернитесь сюда с этого адреса, впишите его в поле «Адрес сайта» ниже и привяжите Telegram — на этом всё готово.</li>
+                    <ol className="mt-2 list-decimal space-y-1.5 pl-5 text-[12px] leading-relaxed text-zinc-400">
+                      <li><b className="text-zinc-200">База.</b> Зайдите на <b className="text-zinc-200">neon.tech</b>, создайте бесплатный проект. В панели проекта скопируйте строку подключения (начинается с postgresql://) — это ваш DATABASE_URL.</li>
+                      <li><b className="text-zinc-200">Сайт.</b> Зайдите на <b className="text-zinc-200">render.com</b> → New → Web Service → выберите репозиторий с сайтом. Команда сборки: <code className="mono rounded bg-zinc-800 px-1">npm install {"&&"} npm run build</code>. Команда запуска: <code className="mono rounded bg-zinc-800 px-1">npm start</code>.</li>
+                      <li><b className="text-zinc-200">Ключи.</b> На Render откройте вкладку Environment и добавьте три переменные: DATABASE_URL (из шага 1), EXBO_CLIENT_ID и EXBO_CLIENT_SECRET.</li>
+                      <li><b className="text-zinc-200">Пинг.</b> Настройте cron-job.org по инструкции выше — иначе Render будет спать и проверки остановятся.</li>
+                      <li><b className="text-zinc-200">Финал.</b> Откройте адрес вида xxx.onrender.com, вставьте его в поле «Адрес сайта» выше и сохраните — иначе кнопки в Telegram не будут вести на сайт. Потом привяжите Telegram.</li>
                     </ol>
-                    <p className="mt-2.5 text-[11.5px] text-zinc-600">
-                      Более подробная версия этой инструкции — в файле <code className="mono rounded bg-zinc-800 px-1">HOSTING.md</code> в корне проекта.
-                    </p>
                   </details>
                 </div>
               </section>
@@ -2012,14 +2010,13 @@ export default function AuctionApp() {
                 <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
                   <Database className="h-4 w-4 text-zinc-500" />
                   <p className="min-w-0 flex-1 text-[12px] text-zinc-400">
-                    Когда разработчики добавляют в игру новый предмет, сайт сам подтягивает его в каталог
-                    (проверка раз в 6 часов). Если нужен предмет прямо сейчас — не ждите, обновите вручную:
+                    База предметов обновляется из GitHub автоматически. Можно обновить вручную:
                   </p>
                   <button
                     onClick={syncItems}
                     className="rounded-xl border border-zinc-700 bg-zinc-800 px-4 py-2 text-[12.5px] font-medium text-zinc-200 hover:bg-zinc-700"
                   >
-                    Обновить сейчас
+                    Обновить базу
                   </button>
                 </div>
               </section>
@@ -2028,17 +2025,15 @@ export default function AuctionApp() {
               <section className="rounded-2xl border border-[#d4ff3f]/20 bg-[#d4ff3f]/[0.03] p-5">
                 <div className="flex items-center gap-2">
                   <Zap className="h-4 w-4 text-[#d4ff3f]" />
-                  <h2 className="text-[15px] font-bold text-white">Откуда приходят уведомления — коротко</h2>
+                  <h2 className="text-[15px] font-bold text-white">Как работает пассивный трекинг</h2>
                 </div>
                 <ol className="mt-2 space-y-2 text-[12.5px] leading-relaxed text-zinc-400">
-                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">1.</span> Пока сервер сайта запущен — он сам, по расписанию (по умолчанию раз в 10 минут), заходит на аукцион и сверяет ваши трекеры.</li>
-                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">2.</span> Если хостинг бесплатный и "засыпает" — внешний будильник (cron-job.org) не даёт ему уснуть.</li>
-                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">3.</span> Открытая в браузере страница проверяет ещё чаще и добавляет звук + всплывающее уведомление на компьютере.</li>
+                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">1.</span> Сервер сам смотрит аукцион каждые N секунд и присылает в Telegram только новые лоты. Сайт держать открытым не надо.</li>
+                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">2.</span> Если сайт на бесплатном хостинге — cron-пинг его будит, проверки не останавливаются.</li>
+                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">3.</span> Открытая вкладка проверяет чаще (каждые 30 секунд) и добавляет звук + всплывающие уведомления.</li>
                 </ol>
                 <p className="mt-2 rounded-xl bg-zinc-900/60 px-3 py-2 text-[11.5px] leading-relaxed text-zinc-500">
-                  Дублей не будет: сообщение приходит только про лот, которого не было при прошлой проверке.
-                  А в самый первый раз после создания трекера сайт молча запоминает, что сейчас есть на аукционе,
-                  и не присылает лишнего — уведомления начнутся только про новые лоты, появившиеся позже.
+                  Один и тот же лот дважды не придёт: сайт запоминает, что уже показывал. Первый запуск трекера молчаливый — он просто запоминает текущие лоты, а следить начинает со следующего обновления.
                 </p>
               </section>
             </div>
@@ -2046,25 +2041,31 @@ export default function AuctionApp() {
         )}
       </main>
 
-      {/* ===== Footer ===== */}
+      {/* ===== Footer: только обратный отсчёт до обновления ===== */}
       <footer className="border-t border-zinc-800/60 py-4">
         <div className="mx-auto flex max-w-[1280px] items-center justify-center px-4">
-          {footerCountdown ? (
-            <button
-              onClick={() => setView("settings")}
-              title="Настройки фонового трекинга"
-              className="flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/60 px-4 py-1.5 text-[12px] text-zinc-400 transition hover:border-zinc-700 hover:text-zinc-200"
-            >
+          {view === "auction" && autoRefresh && nextRefreshAt ? (
+            <span className="mono flex items-center gap-2 text-[13px] font-semibold text-zinc-300">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 live-dot" />
-              {footerCountdown.label}{" "}
-              <span className="mono font-semibold text-zinc-200">
-                {footerCountdown.secs > 0
-                  ? `${Math.floor(footerCountdown.secs / 60)}:${String(footerCountdown.secs % 60).padStart(2, "0")}`
-                  : "обновляется…"}
+              Обновление аукциона через
+              <span className="text-[#d4ff3f]">
+                {formatCountdown(nextRefreshAt - nowMs)}
               </span>
+              {lotsRefreshing && <span className="text-[11px] font-normal text-zinc-500">· загружаю…</span>}
+            </span>
+          ) : view === "auction" ? (
+            <button
+              onClick={() => setAutoRefresh(true)}
+              className="flex items-center gap-2 text-[13px] text-zinc-500 hover:text-zinc-200"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-zinc-600" />
+              Автообновление выключено — включить
             </button>
           ) : (
-            <span className="text-[12px] text-zinc-600">AucTracker</span>
+            <span className="flex items-center gap-2 text-[12.5px] text-zinc-600">
+              <span className="h-1.5 w-1.5 rounded-full bg-zinc-700" />
+              Откройте аукцион — цены подтягиваются сами каждые 30 секунд
+            </span>
           )}
         </div>
       </footer>
@@ -2213,7 +2214,7 @@ export default function AuctionApp() {
               </div>
 
               <p className="rounded-xl bg-zinc-900/60 px-3 py-2 text-[11.5px] leading-relaxed text-zinc-500">
-                💡 Сервер проверяет аукцион каждые {Math.round((scheduler?.interval || 600) / 60) || 1} мин — уведомления в Telegram приходят, даже когда сайт закрыт. Открытая вкладка дополнительно проверяет каждые {checkInterval} сек + звук и пуши в браузере.
+                💡 Сервер проверяет аукцион каждые {scheduler?.interval || 60} сек — уведомления в Telegram приходят, даже когда сайт закрыт. Открытая вкладка проверяет чаще (каждые {checkInterval} сек) + звук и пуши в браузере.
               </p>
             </div>
 

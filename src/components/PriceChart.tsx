@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { formatCompact, formatPrice } from "@/lib/utils";
 
 interface Point {
@@ -8,271 +8,375 @@ interface Point {
   price: number;
 }
 
-interface Props {
+interface P {
+  t: number;
+  price: number;
+  time: string;
+}
+
+const PAD_L = 58;
+const PAD_R = 14;
+const PAD_T = 18;
+const PAD_B = 26;
+const MAX_DRAWN = 1200;
+
+/** «Красивые» шаги сетки, гарантированно покрывающие [lo, hi] */
+function niceTicks(lo: number, hi: number, count: number): number[] {
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return [lo, hi];
+  const span = hi - lo;
+  const step0 = span / Math.max(1, count);
+  const mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const norm = step0 / mag;
+  const step = (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag;
+  const prec = Math.max(0, -Math.floor(Math.log10(step)));
+  const ticks: number[] = [];
+  for (
+    let v = Math.ceil(lo / step - 1e-9) * step;
+    v <= hi + step * 0.51;
+    v += step
+  ) {
+    ticks.push(Number(v.toFixed(prec)));
+    if (ticks.length > 14) break;
+  }
+  return ticks.length ? ticks : [lo, hi];
+}
+
+export default function PriceChart({
+  data,
+  height = 240,
+}: {
   data: Point[];
-  /** Точная текущая максимальная цена активного лота (не из истории) — если
-   *  она выше пика на графике, показываем отдельной пунктирной линией,
-   *  чтобы не создавалось впечатление, будто график "теряет" высокие цены. */
-  referenceMax?: number;
-}
-
-const VBW = 1000;
-const VBH = 320;
-const PAD_L = 64;
-const PAD_R = 16;
-const PAD_T = 26;
-const PAD_B = 34;
-
-// Округление шкалы до "красивых" чисел (1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10 × 10^n),
-// чтобы верхняя подпись графика ВСЕГДА была не меньше реального пика данных.
-const NICE_STEPS = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
-
-function niceCeil(value: number): number {
-  if (!Number.isFinite(value) || value <= 0) return 1;
-  const exponent = Math.floor(Math.log10(value));
-  const base = Math.pow(10, exponent);
-  const fraction = value / base;
-  const step = NICE_STEPS.find((s) => s >= fraction - 1e-9) ?? 10;
-  return Math.round(step * base * 100) / 100;
-}
-
-function niceFloor(value: number): number {
-  if (!Number.isFinite(value) || value <= 0) return 0;
-  const exponent = Math.floor(Math.log10(value));
-  const base = Math.pow(10, exponent);
-  const fraction = value / base;
-  const steps = [...NICE_STEPS].reverse();
-  const step = steps.find((s) => s <= fraction + 1e-9) ?? 1;
-  return Math.round(step * base * 100) / 100;
-}
-
-export default function PriceChart({ data, referenceMax }: Props) {
+  height?: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
-  const valid = useMemo(
-    () =>
-      data
-        .filter((d) => d.price > 0 && d.time)
-        .map((d) => ({ price: d.price, t: new Date(d.time as string).getTime() }))
-        .filter((d) => Number.isFinite(d.t))
-        .sort((a, b) => a.t - b.t),
-    [data]
-  );
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const update = () => setWidth(Math.floor(el.clientWidth));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
-  const { yMin, yMax, tMin, tMax, peak, trough } = useMemo(() => {
-    if (valid.length === 0) {
-      return { yMin: 0, yMax: 1, tMin: 0, tMax: 1, peak: null as typeof valid[number] | null, trough: null as typeof valid[number] | null };
+  const model = useMemo(() => {
+    // Точки без времени ломают ось X (уходили в 1970-й и сплющивали весь график) — их отбрасываем
+    const pts: P[] = [];
+    for (const d of data) {
+      if (!Number.isFinite(d.price) || d.price <= 0 || !d.time) continue;
+      const t = new Date(d.time).getTime();
+      if (Number.isNaN(t)) continue;
+      pts.push({ t, price: d.price, time: d.time });
     }
-    let peakP = valid[0];
-    let troughP = valid[0];
-    let tMinV = valid[0].t;
-    let tMaxV = valid[0].t;
-    for (const p of valid) {
-      if (p.price > peakP.price) peakP = p;
-      if (p.price < troughP.price) troughP = p;
-      if (p.t < tMinV) tMinV = p.t;
-      if (p.t > tMaxV) tMaxV = p.t;
+    pts.sort((a, b) => a.t - b.t || a.price - b.price);
+    if (pts.length === 0) return null;
+
+    // Прореживание для скорости: среднее по корзинам, min/max всегда сохраняем
+    let arr = pts;
+    if (pts.length > MAX_DRAWN) {
+      const bucket = Math.ceil(pts.length / MAX_DRAWN);
+      const out: P[] = [];
+      for (let i = 0; i < pts.length; i += bucket) {
+        const slice = pts.slice(i, i + bucket);
+        const sum = slice.reduce((a, p) => a + p.price, 0);
+        const mid = slice[Math.floor(slice.length / 2)];
+        out.push({
+          t: mid.t,
+          price: Math.round(sum / slice.length),
+          time: mid.time,
+        });
+      }
+      // Возвращаем реальные экстремумы, чтобы вершины не терялись
+      let mn = pts[0];
+      let mx = pts[0];
+      for (const p of pts) {
+        if (p.price < mn.price) mn = p;
+        if (p.price >= mx.price) mx = p;
+      }
+      out.push(mn, mx);
+      out.sort((a, b) => a.t - b.t || a.price - b.price);
+      arr = out;
     }
-    const domainMax = Math.max(peakP.price, referenceMax || 0);
-    const domainMin = troughP.price;
-    const span = Math.max(domainMax - domainMin, domainMax * 0.06, 1);
-    const paddedMax = domainMax + span * 0.14;
-    const paddedMin = Math.max(0, domainMin - span * 0.14);
-    return {
-      yMin: domainMin > 0 ? niceFloor(paddedMin) : 0,
-      yMax: niceCeil(paddedMax),
-      tMin: tMinV,
-      tMax: Math.max(tMaxV, tMinV + 60000),
-      peak: peakP,
-      trough: troughP,
-    };
-  }, [valid, referenceMax]);
 
-  const xOf = (t: number) => PAD_L + ((t - tMin) / (tMax - tMin || 1)) * (VBW - PAD_L - PAD_R);
-  const yOf = (p: number) => PAD_T + (1 - (p - yMin) / (yMax - yMin || 1)) * (VBH - PAD_T - PAD_B);
-
-  const points = useMemo(() => valid.map((d) => ({ ...d, x: xOf(d.t), y: yOf(d.price) })), [valid, tMin, tMax, yMin, yMax]);
-
-  const linePath = useMemo(() => {
-    if (points.length === 0) return "";
-    return points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
-  }, [points]);
-
-  const areaPath = useMemo(() => {
-    if (points.length === 0) return "";
-    const base = VBH - PAD_B;
-    return (
-      `M${points[0].x.toFixed(1)},${base} ` +
-      points.map((p) => `L${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ") +
-      ` L${points[points.length - 1].x.toFixed(1)},${base} Z`
-    );
-  }, [points]);
-
-  const gridLines = useMemo(() => {
-    const n = 5;
-    return Array.from({ length: n + 1 }, (_, i) => yMin + ((yMax - yMin) * i) / n);
-  }, [yMin, yMax]);
-
-  const timeLabels = useMemo(() => {
-    const n = 5;
-    return Array.from({ length: n + 1 }, (_, i) => tMin + ((tMax - tMin) * i) / n);
-  }, [tMin, tMax]);
-
-  const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (points.length === 0) return;
-    const svg = e.currentTarget;
-    const rect = svg.getBoundingClientRect();
-    const relX = ((e.clientX - rect.left) / rect.width) * VBW;
-    let bestIdx = 0;
-    let bestDist = Infinity;
-    points.forEach((p, i) => {
-      const d = Math.abs(p.x - relX);
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = i;
+    let min = Infinity;
+    let max = -Infinity;
+    let minIdx = 0;
+    let maxIdx = 0;
+    arr.forEach((p, i) => {
+      if (p.price < min) {
+        min = p.price;
+        minIdx = i;
+      }
+      if (p.price >= max) {
+        max = p.price;
+        maxIdx = i;
       }
     });
-    setHoverIdx(bestIdx);
+
+    let lo = min;
+    let hi = max;
+    if (hi - lo <= 0) {
+      lo = Math.max(0, min * 0.9);
+      hi = max * 1.1 || 1;
+    } else {
+      const pad = (hi - lo) * 0.18;
+      lo = Math.max(0, lo - pad);
+      hi = hi + pad;
+    }
+    const t0 = arr[0].t;
+    const t1 = arr[arr.length - 1].t > t0 ? arr[arr.length - 1].t : t0 + 60000;
+    return { arr, min, max, minIdx, maxIdx, lo, hi, t0, t1 };
+  }, [data]);
+
+  const innerW = Math.max(10, width - PAD_L - PAD_R);
+  const innerH = Math.max(10, height - PAD_T - PAD_B);
+
+  const xOf = (t: number) =>
+    !model ? 0 : PAD_L + ((t - model.t0) / (model.t1 - model.t0)) * innerW;
+  const yOf = (p: number) =>
+    !model ? 0 : PAD_T + (1 - (p - model.lo) / (model.hi - model.lo)) * innerH;
+
+  // ---------- Рисование ----------
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || width < 10 || !model) return;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    const { arr, lo, hi } = model;
+    const lx = (t: number) =>
+      PAD_L + ((t - model.t0) / (model.t1 - model.t0)) * innerW;
+    const ly = (p: number) =>
+      PAD_T + (1 - (p - lo) / (hi - lo)) * innerH;
+
+    // Сетка + подписи оси Y (верхняя линия всегда >= максимума)
+    ctx.font = "10px Inter, sans-serif";
+    ctx.lineWidth = 1;
+    for (const v of niceTicks(lo, hi, 5)) {
+      const y = ly(v);
+      ctx.beginPath();
+      ctx.setLineDash([3, 4]);
+      ctx.strokeStyle = "rgba(255,255,255,0.07)";
+      ctx.moveTo(PAD_L, y);
+      ctx.lineTo(width - PAD_R, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#71717a";
+      ctx.textAlign = "right";
+      ctx.fillText(formatCompact(v), PAD_L - 8, y + 3);
+    }
+
+    // Подписи времени
+    ctx.fillStyle = "#5b5b63";
+    ctx.textAlign = "center";
+    for (let i = 0; i <= 4; i++) {
+      const t = model.t0 + ((model.t1 - model.t0) * i) / 4;
+      const x = lx(t);
+      const dt = new Date(t);
+      const sameDay =
+        new Date(model.t0).toDateString() === new Date(model.t1).toDateString();
+      const label = sameDay
+        ? dt.toLocaleString("ru-RU", { hour: "2-digit", minute: "2-digit" })
+        : dt.toLocaleString("ru-RU", {
+            day: "2-digit",
+            month: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+      const cx = Math.min(Math.max(x, PAD_L + 20), width - PAD_R - 20);
+      ctx.fillText(label, cx, height - 8);
+    }
+
+    // Заливка
+    const grad = ctx.createLinearGradient(0, PAD_T, 0, height - PAD_B);
+    grad.addColorStop(0, "rgba(212,255,63,0.20)");
+    grad.addColorStop(1, "rgba(212,255,63,0)");
+    ctx.beginPath();
+    ctx.moveTo(lx(arr[0].t), height - PAD_B);
+    for (const p of arr) ctx.lineTo(lx(p.t), ly(p.price));
+    ctx.lineTo(lx(arr[arr.length - 1].t), height - PAD_B);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Линия
+    ctx.beginPath();
+    arr.forEach((p, i) => {
+      if (i === 0) ctx.moveTo(lx(p.t), ly(p.price));
+      else ctx.lineTo(lx(p.t), ly(p.price));
+    });
+    ctx.strokeStyle = "#d4ff3f";
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.stroke();
+
+    // Точки при малом количестве сделок
+    if (arr.length <= 120) {
+      ctx.fillStyle = "#d4ff3f";
+      for (const p of arr) {
+        ctx.beginPath();
+        ctx.arc(lx(p.t), ly(p.price), 2.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Маркер минимума
+    const mn = arr[model.minIdx];
+    ctx.beginPath();
+    ctx.arc(lx(mn.t), ly(mn.price), 3, 0, Math.PI * 2);
+    ctx.fillStyle = "#0a0a0c";
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#71717a";
+    ctx.stroke();
+
+    // Маркер максимума — вершина всегда видна
+    const mx = arr[model.maxIdx];
+    ctx.beginPath();
+    ctx.arc(lx(mx.t), ly(mx.price), 6, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(212,255,63,0.25)";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(lx(mx.t), ly(mx.price), 3.2, 0, Math.PI * 2);
+    ctx.fillStyle = "#d4ff3f";
+    ctx.fill();
+  }, [width, height, model, innerW, innerH]);
+
+  const pick = (clientX: number): number | null => {
+    if (!model) return null;
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    const mx = clientX - rect.left;
+    let best = 0;
+    let bestDist = Infinity;
+    const { arr } = model;
+    for (let i = 0; i < arr.length; i++) {
+      const dist = Math.abs(xOf(arr[i].t) - mx);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
+      }
+    }
+    return best;
   };
 
-  const hoverPoint = hoverIdx !== null ? points[hoverIdx] : null;
-  const refY = referenceMax && referenceMax > 0 ? yOf(referenceMax) : null;
-  const showRefLine = refY !== null && peak && referenceMax! > peak.price * 1.02;
+  const hover = hoverIdx !== null && model ? model.arr[hoverIdx] : null;
+  const maxPt = model ? model.arr[model.maxIdx] : null;
+  // Подпись пика: над точкой, но если вершина у самого верха — под ней
+  const maxLabelBelow =
+    maxPt !== null && model ? yOf(maxPt.price) < PAD_T + 30 : false;
+
+  if (!model) {
+    return (
+      <div className="grid h-[240px] place-items-center text-center">
+        <div>
+          <p className="text-[13.5px] font-medium text-zinc-400">
+            Нет данных за выбранный период
+          </p>
+          <p className="mt-1 text-[12px] text-zinc-600">
+            Попробуйте другой период или регион
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const fmtFull = (v: number) => `${formatPrice(v)} ₽`;
+  const tipLeft =
+    hover && model
+      ? Math.min(Math.max(xOf(hover.t), 86), Math.max(86, width - 86))
+      : 0;
 
   return (
     <div ref={wrapRef} className="relative w-full select-none">
-      <svg
-        viewBox={`0 0 ${VBW} ${VBH}`}
-        preserveAspectRatio="none"
-        className="h-[240px] w-full overflow-visible"
-        onMouseMove={onMove}
+      <canvas
+        ref={canvasRef}
+        style={{ width: "100%", height, display: "block", cursor: "crosshair" }}
+        onMouseMove={(e) => setHoverIdx(pick(e.clientX))}
         onMouseLeave={() => setHoverIdx(null)}
-      >
-        <defs>
-          <linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#d4ff3f" stopOpacity="0.28" />
-            <stop offset="100%" stopColor="#d4ff3f" stopOpacity="0" />
-          </linearGradient>
-        </defs>
+        onTouchStart={(e) => {
+          if (e.touches[0]) setHoverIdx(pick(e.touches[0].clientX));
+        }}
+        onTouchMove={(e) => {
+          if (e.touches[0]) setHoverIdx(pick(e.touches[0].clientX));
+        }}
+        onTouchEnd={() => setHoverIdx(null)}
+      />
 
-        {/* сетка + подписи оси Y */}
-        {gridLines.map((v, i) => {
-          const y = yOf(v);
-          return (
-            <g key={i}>
-              <line x1={PAD_L} x2={VBW - PAD_R} y1={y} y2={y} stroke="rgba(255,255,255,0.07)" strokeWidth={1} strokeDasharray="3,4" />
-              <text x={PAD_L - 10} y={y + 4} textAnchor="end" fontSize="12" fill="#71717a">
-                {formatCompact(Math.round(v))}
-              </text>
-            </g>
-          );
-        })}
-
-        {valid.length === 0 ? (
-          <text x={VBW / 2} y={VBH / 2} textAnchor="middle" fontSize="15" fill="#52525b">
-            Нет данных за выбранный период
-          </text>
-        ) : (
-          <>
-            {/* пунктир текущей максимальной цены активного лота, если она выше пика продаж */}
-            {showRefLine && refY !== null && (
-              <g>
-                <line x1={PAD_L} x2={VBW - PAD_R} y1={refY} y2={refY} stroke="#f87171" strokeWidth={1.4} strokeDasharray="6,4" opacity={0.75} />
-                <text x={VBW - PAD_R} y={refY - 6} textAnchor="end" fontSize="11.5" fill="#f87171">
-                  сейчас на аукционе: {formatPrice(referenceMax)} ₽
-                </text>
-              </g>
-            )}
-
-            <path d={areaPath} fill="url(#chartFill)" />
-            <path d={linePath} fill="none" stroke="#d4ff3f" strokeWidth={2.5} strokeLinejoin="round" strokeLinecap="round" />
-
-            {points.length <= 150 &&
-              points.map((p, i) => (
-                <circle key={i} cx={p.x} cy={p.y} r={2.6} fill="#d4ff3f" opacity={0.85} />
-              ))}
-
-            {/* пик — всегда подписан явно, чтобы не терялся визуально */}
-            {peak && (
-              <g>
-                <circle cx={xOf(peak.t)} cy={yOf(peak.price)} r={4.5} fill="#0a0a0c" stroke="#d4ff3f" strokeWidth={2.5} />
-                <text
-                  x={Math.min(Math.max(xOf(peak.t), PAD_L + 40), VBW - PAD_R - 40)}
-                  y={Math.max(yOf(peak.price) - 12, 14)}
-                  textAnchor="middle"
-                  fontSize="12"
-                  fontWeight={700}
-                  fill="#d4ff3f"
-                >
-                  ▲ {formatPrice(peak.price)} ₽
-                </text>
-              </g>
-            )}
-            {trough && trough.price !== peak?.price && (
-              <g>
-                <circle cx={xOf(trough.t)} cy={yOf(trough.price)} r={4} fill="#0a0a0c" stroke="#f87171" strokeWidth={2} />
-                <text
-                  x={Math.min(Math.max(xOf(trough.t), PAD_L + 40), VBW - PAD_R - 40)}
-                  y={Math.min(yOf(trough.price) + 20, VBH - PAD_B - 6)}
-                  textAnchor="middle"
-                  fontSize="11.5"
-                  fontWeight={600}
-                  fill="#f87171"
-                >
-                  ▼ {formatPrice(trough.price)} ₽
-                </text>
-              </g>
-            )}
-
-            {/* курсор наведения */}
-            {hoverPoint && (
-              <g>
-                <line x1={hoverPoint.x} x2={hoverPoint.x} y1={PAD_T} y2={VBH - PAD_B} stroke="rgba(255,255,255,0.18)" strokeWidth={1} />
-                <circle cx={hoverPoint.x} cy={hoverPoint.y} r={5} fill="#d4ff3f" stroke="#0a0a0c" strokeWidth={2} />
-              </g>
-            )}
-          </>
-        )}
-
-        {/* подписи оси времени */}
-        {valid.length > 0 &&
-          timeLabels.map((t, i) => (
-            <text key={i} x={xOf(t)} y={VBH - 10} textAnchor="middle" fontSize="11" fill="#63636b">
-              {new Date(t).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
-            </text>
-          ))}
-      </svg>
-
-      {hoverPoint && (
+      {/* Подпись пика с точной ценой */}
+      {maxPt && model && (
         <div
-          className="chart-tip"
+          className="pointer-events-none absolute z-10"
           style={{
-            left: `${(hoverPoint.x / VBW) * 100}%`,
-            top: `${(hoverPoint.y / VBH) * 100}%`,
+            left: Math.min(
+              Math.max(xOf(maxPt.t), 70),
+              Math.max(70, width - 70)
+            ),
+            top: yOf(maxPt.price),
+            transform: maxLabelBelow
+              ? "translate(-50%, 12px)"
+              : "translate(-50%, -100%) translateY(-10px)",
           }}
         >
-          <div className="rounded-lg border border-zinc-700 bg-zinc-950/95 px-3 py-1.5 shadow-xl">
-            <div className="mono text-[13px] font-bold text-[#d4ff3f]">{formatPrice(hoverPoint.price)} ₽</div>
-            <div className="text-[11px] text-zinc-400">
-              {new Date(hoverPoint.t).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
-            </div>
+          <div className="mono whitespace-nowrap rounded-lg border border-[#d4ff3f]/40 bg-zinc-950/95 px-2 py-0.5 text-[11.5px] font-bold text-[#d4ff3f] shadow-lg">
+            ▲ {fmtFull(model.max)}
           </div>
         </div>
       )}
 
-      <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500">
-        <span className="flex items-center gap-3">
-          <span className="flex items-center gap-1.5">
-            <span className="inline-block h-[2px] w-5 bg-[#d4ff3f]" /> Цена за шт.
-          </span>
-          {showRefLine && (
-            <span className="flex items-center gap-1.5">
-              <span className="inline-block h-[2px] w-5 border-t border-dashed border-red-400" /> Макс. лот сейчас
-            </span>
-          )}
+      {/* Перекрестие + тултип */}
+      {hover && model && hoverIdx !== null && (
+        <>
+          <div
+            className="pointer-events-none absolute top-0 bottom-6 w-px bg-white/25"
+            style={{ left: xOf(hover.t) }}
+          />
+          <div
+            className="pointer-events-none absolute z-20 h-2.5 w-2.5 rounded-full border-2 border-[#d4ff3f] bg-zinc-950"
+            style={{
+              left: xOf(hover.t) - 5,
+              top: yOf(hover.price) - 5,
+            }}
+          />
+          <div
+            className="chart-tip"
+            style={{ left: tipLeft, top: yOf(hover.price) - 6 }}
+          >
+            <div className="rounded-lg border border-zinc-700 bg-zinc-950/95 px-3 py-1.5 shadow-xl">
+              <div className="mono text-[13px] font-bold whitespace-nowrap text-[#d4ff3f]">
+                {fmtFull(hover.price)}
+              </div>
+              <div className="text-[11px] whitespace-nowrap text-zinc-400">
+                {new Date(hover.t).toLocaleString("ru-RU", {
+                  day: "2-digit",
+                  month: "2-digit",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-zinc-500">
+        <span className="flex items-center gap-2">
+          <span className="inline-block h-[2px] w-5 bg-[#d4ff3f]" /> Цена за шт.
         </span>
-        <span>{valid.length} сделок в выборке · наведите на график для деталей</span>
+        <span className="mono">
+          мин {fmtFull(model.min)} · макс {fmtFull(model.max)}
+        </span>
+        <span className="ml-auto">{model.arr.length} сделок</span>
       </div>
     </div>
   );

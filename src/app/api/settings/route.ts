@@ -59,7 +59,7 @@ export async function PUT(req: NextRequest) {
       if (k === "scheduler_enabled" || k === "telegram_enabled")
         val = val === "1" ? "1" : "0";
       if (k === "scheduler_interval")
-        val = String(Math.min(3600, Math.max(30, Number(val) || 600)));
+        val = String(Math.min(3600, Math.max(15, Number(val) || 60)));
       if (k === "site_url") val = val.trim().replace(/\/$/, "");
       await setSetting(k, val);
     }
