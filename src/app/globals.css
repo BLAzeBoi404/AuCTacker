@@ -1,0 +1,152 @@
+@import "tailwindcss";
+
+@theme {
+  --color-void: #060607;
+  --color-panel: #101012;
+  --color-card: #151517;
+  --color-edge: #232326;
+  --color-mist: #a1a1aa;
+  --color-accent: #d4ff3f;
+}
+
+html {
+  background: #060607;
+}
+
+body {
+  background: #060607;
+  color: #e4e4e7;
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #0c0c0e;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a2a2e;
+  border-radius: 8px;
+  border: 2px solid #0c0c0e;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3a40;
+}
+
+/* Animations */
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.5;
+    transform: scale(0.85);
+  }
+}
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(30px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+
+.anim-fade-up {
+  animation: fadeUp 0.35s ease both;
+}
+.anim-slide-in {
+  animation: slide-in 0.3s ease both;
+}
+.live-dot {
+  animation: pulse-dot 1.6s ease infinite;
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #17171a 25%, #222226 50%, #17171a 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+}
+
+/* Text helpers */
+.mono {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom select/input reset for dark */
+select option {
+  background: #151517;
+  color: #e4e4e7;
+}
+
+/* Chart tooltip */
+.chart-tip {
+  pointer-events: none;
+  position: absolute;
+  z-index: 20;
+  transform: translate(-50%, -110%);
+  white-space: nowrap;
+}
+
+/* Grid bg hero */
+.hero-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 42px 42px;
+  mask-image: radial-gradient(ellipse 90% 80% at 50% 0%, black 30%, transparent 75%);
+}
+
+::selection {
+  background: rgba(212, 255, 63, 0.25);
+  color: #fff;
+}
+
+details > summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+details > summary::-webkit-details-marker {
+  display: none;
+}
+details[open] > summary svg {
+  transform: rotate(180deg);
+}
+details > summary svg {
+  transition: transform 0.2s ease;
+}
+
+button {
+  cursor: pointer;
+}
+button:disabled {
+  cursor: not-allowed;
+}
