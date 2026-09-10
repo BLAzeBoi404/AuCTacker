@@ -1,14 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { trackers } from "@/db/schema";
-import { desc } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { normalizeRegion } from "@/lib/exbo";
+import { getOwnerKey } from "@/lib/identity";
+import { ensureSchema } from "@/lib/ensure-schema";
 
 export const dynamic = "force-dynamic";
 
+// Максимум трекеров на один профиль — защита от переполнения общей базы
+const MAX_TRACKERS_PER_USER = 25;
+
 export async function GET() {
   try {
-    const rows = await db.select().from(trackers).orderBy(desc(trackers.createdAt));
+    await ensureSchema();
+    const owner = await getOwnerKey();
+    const rows = await db
+      .select()
+      .from(trackers)
+      .where(eq(trackers.ownerKey, owner))
+      .orderBy(desc(trackers.createdAt));
     return NextResponse.json({ success: true, trackers: rows });
   } catch (e) {
     console.error("GET /api/trackers failed:", e);
@@ -18,14 +29,29 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    await ensureSchema();
+    const owner = await getOwnerKey();
     const body = await req.json();
     const itemId = String(body.itemId || "").toLowerCase().trim();
     if (!itemId) {
       return NextResponse.json({ success: false, error: "itemId_required" }, { status: 400 });
     }
+
+    const mine = await db
+      .select({ id: trackers.id })
+      .from(trackers)
+      .where(eq(trackers.ownerKey, owner));
+    if (mine.length >= MAX_TRACKERS_PER_USER) {
+      return NextResponse.json(
+        { success: false, error: "limit_reached", message: `Максимум ${MAX_TRACKERS_PER_USER} трекеров на профиль. Удалите ненужные.` },
+        { status: 400 }
+      );
+    }
+
     const [row] = await db
       .insert(trackers)
       .values({
+        ownerKey: owner,
         itemId,
         itemName: String(body.itemName || itemId),
         itemIcon: body.itemIcon ? String(body.itemIcon) : null,
@@ -40,9 +66,7 @@ export async function POST(req: NextRequest) {
         enabled: body.enabled ?? true,
         enableSound: false,
         enableBrowser: false,
-        notifyChatIds: Array.isArray(body.notifyChatIds)
-          ? body.notifyChatIds.map(String).slice(0, 20)
-          : [],
+        notifyChatIds: [],
       })
       .returning();
     return NextResponse.json({ success: true, tracker: row });

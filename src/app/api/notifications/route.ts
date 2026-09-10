@@ -1,23 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { notifications } from "@/db/schema";
-import { desc, sql } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
+import { getOwnerKey } from "@/lib/identity";
+import { ensureSchema } from "@/lib/ensure-schema";
 
 export const dynamic = "force-dynamic";
 
+// Каждый видит только свои уведомления
 export async function GET(req: NextRequest) {
   try {
+    await ensureSchema();
+    const owner = await getOwnerKey();
     const { searchParams } = new URL(req.url);
     const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") || 30)));
     const rows = await db
       .select()
       .from(notifications)
+      .where(eq(notifications.ownerKey, owner))
       .orderBy(desc(notifications.createdAt))
       .limit(limit);
-    const unreadRes = await db.execute(
-      sql`select count(*)::int as c from notifications where is_read = false`
-    );
-    const unread = Number((unreadRes.rows[0] as unknown as { c: number })?.c || 0);
+    const unread = rows.filter((r) => !r.isRead).length;
     return NextResponse.json({ success: true, notifications: rows, unread });
   } catch (e) {
     console.error("GET /api/notifications failed:", e);
@@ -27,11 +30,19 @@ export async function GET(req: NextRequest) {
 
 export async function PATCH(req: NextRequest) {
   try {
+    await ensureSchema();
+    const owner = await getOwnerKey();
     const body = await req.json().catch(() => ({}));
     if (body.all === true) {
-      await db.execute(sql`update notifications set is_read = true where is_read = false`);
+      await db
+        .update(notifications)
+        .set({ isRead: true })
+        .where(and(eq(notifications.ownerKey, owner), eq(notifications.isRead, false)));
     } else if (body.id) {
-      await db.execute(sql`update notifications set is_read = true where id = ${Number(body.id)}`);
+      await db
+        .update(notifications)
+        .set({ isRead: true })
+        .where(and(eq(notifications.ownerKey, owner), eq(notifications.id, Number(body.id))));
     }
     return NextResponse.json({ success: true });
   } catch (e) {
@@ -42,9 +53,11 @@ export async function PATCH(req: NextRequest) {
 
 export async function DELETE() {
   try {
-    await db.execute(sql`delete from notifications`);
+    await ensureSchema();
+    const owner = await getOwnerKey();
+    await db.delete(notifications).where(eq(notifications.ownerKey, owner));
     return NextResponse.json({ success: true });
-  } catch (e) {
+  } catch {
     return NextResponse.json({ success: false }, { status: 500 });
   }
 }

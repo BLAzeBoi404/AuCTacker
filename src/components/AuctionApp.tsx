@@ -194,11 +194,29 @@ function formatCountdown(ms: number): string {
 
 export default function AuctionApp() {
   // ---------- Global state ----------
-  const [view, setView] = useState<"home" | "auction" | "catalog" | "trackers" | "admin">("home");
+  const [view, setView] = useState<"home" | "auction" | "catalog" | "trackers" | "telegram" | "admin">("home");
   const [region, setRegion] = useState("EU");
   const [regionOpen, setRegionOpen] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
+
+  // ---------- Сессия (свой профиль + права админа) ----------
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [adminConfigured, setAdminConfigured] = useState(false);
+  const [adminPassword, setAdminPassword] = useState("");
+  const [adminError, setAdminError] = useState("");
+
+  // ---------- Мой Telegram (для страницы Telegram) ----------
+  const [myTg, setMyTg] = useState<{
+    botReady: boolean;
+    botUsername: string | null;
+    linked: boolean;
+    enabled: boolean;
+    myChat: { name: string | null; username: string | null } | null;
+  } | null>(null);
+  const [myTgCode, setMyTgCode] = useState<string | null>(null);
+  const [myTgDeep, setMyTgDeep] = useState<string | null>(null);
+  const [myTgBusy, setMyTgBusy] = useState(false);
 
   // ---------- Item + search ----------
   const [selectedItem, setSelectedItem] = useState<Item | null>(null);
@@ -382,6 +400,131 @@ export default function AuctionApp() {
     } catch { /* ignore */ }
   }, []);
 
+  const loadSession = useCallback(async () => {
+    try {
+      const d = await fetchJson<{ success: boolean; isAdmin: boolean; adminConfigured: boolean }>(
+        "/api/session"
+      );
+      setIsAdmin(!!d.isAdmin);
+      setAdminConfigured(!!d.adminConfigured);
+    } catch { /* ignore */ }
+  }, []);
+
+  const adminLogin = useCallback(async () => {
+    setAdminError("");
+    try {
+      const d = await fetchJson<{ success: boolean; isAdmin?: boolean }>("/api/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: adminPassword }),
+      });
+      if (d.success) {
+        setIsAdmin(true);
+        setAdminPassword("");
+        pushToast("Вход выполнен", "Админ-панель разблокирована.");
+      } else {
+        setAdminError("Неверный пароль");
+      }
+    } catch {
+      setAdminError("Неверный пароль");
+    }
+  }, [adminPassword, pushToast]);
+
+  const adminLogout = useCallback(async () => {
+    try {
+      await fetchJson("/api/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "logout" }),
+      });
+    } catch { /* ignore */ }
+    setIsAdmin(false);
+    setView("home");
+  }, []);
+
+  // ---------- Мой Telegram ----------
+  const loadMyTg = useCallback(async () => {
+    try {
+      const d = await fetchJson<{
+        success: boolean; botReady: boolean; botUsername: string | null;
+        linked: boolean; enabled: boolean;
+        myChat: { name: string | null; username: string | null } | null;
+      }>("/api/telegram");
+      if (d.success) {
+        setMyTg({
+          botReady: d.botReady, botUsername: d.botUsername,
+          linked: d.linked, enabled: d.enabled, myChat: d.myChat,
+        });
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const myTgGetCode = useCallback(async () => {
+    setMyTgBusy(true);
+    try {
+      const d = await fetchJson<{ success: boolean; code?: string; deepLink?: string | null; error?: string }>(
+        "/api/telegram",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "link-code" }) }
+      );
+      if (d.success && d.code) {
+        setMyTgCode(d.code);
+        setMyTgDeep(d.deepLink || null);
+      } else {
+        pushToast("Пока нельзя", "Бот ещё не подключён администратором.");
+      }
+    } catch {
+      pushToast("Ошибка", "Не удалось получить код.");
+    } finally {
+      setMyTgBusy(false);
+    }
+  }, [pushToast]);
+
+  const myTgCheck = useCallback(async () => {
+    setMyTgBusy(true);
+    try {
+      const d = await fetchJson<{ success: boolean; linked?: boolean }>(
+        "/api/telegram",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "poll" }) }
+      );
+      await loadMyTg();
+      if (d.linked) {
+        setMyTgCode(null);
+        setMyTgDeep(null);
+        pushToast("Готово!", "Ваш Telegram привязан.");
+      } else {
+        pushToast("Пока не вижу", "Отправьте боту /start с кодом и нажмите ещё раз.");
+      }
+    } catch {
+      pushToast("Ошибка", "Не удалось проверить.");
+    } finally {
+      setMyTgBusy(false);
+    }
+  }, [loadMyTg, pushToast]);
+
+  const myTgTest = useCallback(async () => {
+    try {
+      const d = await fetchJson<{ success: boolean }>(
+        "/api/telegram",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "test" }) }
+      );
+      pushToast(d.success ? "Отправлено" : "Ошибка", d.success ? "Проверьте Telegram." : "Не удалось отправить.");
+    } catch {
+      pushToast("Ошибка", "Не удалось отправить тест.");
+    }
+  }, [pushToast]);
+
+  const myTgUnlink = useCallback(async () => {
+    try {
+      await fetchJson("/api/telegram", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "unlink" }),
+      });
+      setMyTgCode(null);
+      setMyTgDeep(null);
+      await loadMyTg();
+      pushToast("Отвязано", "Telegram отключён от этого профиля.");
+    } catch { /* ignore */ }
+  }, [loadMyTg, pushToast]);
+
   // ---------- Настройки / Telegram ----------
   const [settings, setSettings] = useState<SettingsState | null>(null);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
@@ -419,12 +562,8 @@ export default function AuctionApp() {
         setSettings(d.settings);
         setScheduler(d.scheduler);
         setSiteUrlInput(d.settings.site_url || "");
+        setTgBotUsername(d.settings.telegram_bot_username || null);
       }
-    } catch { /* ignore */ }
-    try {
-      const t = await fetchJson<{ success: boolean; chats: TgChat[]; botUsername: string | null }>("/api/telegram");
-      setTgChats(t.chats || []);
-      setTgBotUsername(t.botUsername);
     } catch { /* ignore */ }
   }, []);
 
@@ -586,11 +725,14 @@ export default function AuctionApp() {
 
   useEffect(() => {
     if (view === "admin") loadSettings();
-  }, [view, loadSettings]);
+    if (view === "telegram") loadMyTg();
+  }, [view, loadSettings, loadMyTg]);
 
   useEffect(() => {
-    if (showTrackerModal) loadSettings();
-  }, [showTrackerModal, loadSettings]);
+    if (showTrackerModal) loadMyTg();
+  }, [showTrackerModal, loadMyTg]);
+
+
 
   const onCatalogQuery = (v: string) => {
     setCatalogQuery(v);
@@ -643,10 +785,10 @@ export default function AuctionApp() {
   }, [selectedItem?.id, region]);
 
   useEffect(() => {
+    loadSession();
     loadTrackers();
     loadNotifications();
     loadCatalog("", "all", 1);
-    loadSettings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -796,18 +938,14 @@ export default function AuctionApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [checking, trackers, selectedItem?.id, region]);
 
-  useEffect(() => {
-    if (trackers.filter((t) => t.enabled).length === 0) return;
-    const t = setInterval(() => checkTrackers(true), checkInterval * 1000);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [checkInterval, trackers.length]);
+  // Проверка трекеров идёт в фоне на сервере (планировщик + внешний cron).
+  // Фронт её сам не запускает — это не нагружает сервер и не требует прав.
 
   // ---------- Tracker CRUD ----------
   const saveTracker = async () => {
     if (!selectedItem) return;
     try {
-      await fetchJson("/api/trackers", {
+      const d = await fetchJson<{ success: boolean; error?: string; message?: string }>("/api/trackers", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -816,14 +954,16 @@ export default function AuctionApp() {
           itemIcon: itemIcon(selectedItem),
           region,
           ...trackerForm,
-          notifyChatIds: tgSelected || [],
         }),
       });
+      if (!d.success) {
+        pushToast("Не удалось", d.message || "Проверьте условия трекера.");
+        return;
+      }
       setShowTrackerModal(false);
       loadTrackers();
       pushToast("Трекер создан", `${itemName(selectedItem)} — слежка запущена.`);
       setTrackerForm({ upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1, maxPrice: 0, minPrice: 0 });
-      setTgSelected(null);
     } catch {
       pushToast("Ошибка", "Не удалось создать трекер.");
     }
@@ -965,9 +1105,14 @@ export default function AuctionApp() {
                 <span className="rounded-full bg-[#34d399] px-1.5 py-0.5 text-[10px] font-bold leading-none text-black">{trackers.length}</span>
               )}
             </button>
-            <button onClick={() => setView("admin")} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition ${view === "admin" ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"}`}>
-              <SettingsIcon className="h-3.5 w-3.5 shrink-0" />Админ
+            <button onClick={() => setView("telegram")} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition ${view === "telegram" ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"}`}>
+              <Send className="h-3.5 w-3.5 shrink-0" />Telegram
             </button>
+            {isAdmin && (
+              <button onClick={() => setView("admin")} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition ${view === "admin" ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"}`}>
+                <SettingsIcon className="h-3.5 w-3.5 shrink-0" />Админ
+              </button>
+            )}
           </nav>
 
           <div className="ml-auto flex items-center gap-2">
@@ -1028,7 +1173,8 @@ export default function AuctionApp() {
               { v: "auction", t: "Аукцион" },
               { v: "catalog", t: "Предметы" },
               { v: "trackers", t: `Трекеры (${trackers.length})` },
-              { v: "admin", t: "Админ" },
+              { v: "telegram", t: "Telegram" },
+              ...(isAdmin ? [{ v: "admin" as const, t: "Админ" }] : []),
             ] as const).map((item) => (
               <button
                 key={item.v}
@@ -1690,12 +1836,12 @@ export default function AuctionApp() {
                         )}
                         <div className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
                           <Send className="h-3 w-3 shrink-0 text-sky-500" />
-                          {tgChats.filter((c) => c.isActive).length === 0 ? (
-                            <span>Telegram не привязан</span>
-                          ) : !t.notifyChatIds || t.notifyChatIds.length === 0 ? (
-                            <span>TG: всем привязанным</span>
+                          {myTg?.linked ? (
+                            <span>Придёт в ваш Telegram</span>
                           ) : (
-                            <span className="truncate">TG: {t.notifyChatIds.map((id) => tgChats.find((c) => c.chatId === id)?.name || id).join(", ")}</span>
+                            <button onClick={() => setView("telegram")} className="text-sky-400 hover:underline">
+                              Привязать Telegram →
+                            </button>
                           )}
                         </div>
                       </div>
@@ -1723,10 +1869,144 @@ export default function AuctionApp() {
             )}
           </div>
         )}
-        {view === "admin" && (
-          <div className="mt-5 anim-fade-up">
+        {view === "telegram" && (
+          <div className="mx-auto mt-6 max-w-xl anim-fade-up">
             <h1 className="flex items-center gap-2 text-xl font-bold text-white">
-              <SettingsIcon className="h-5 w-5 text-[#34d399]" /> Админ-панель
+              <Send className="h-5 w-5 text-[#34d399]" /> Уведомления в Telegram
+            </h1>
+            <p className="mt-1 text-[13px] text-zinc-500">
+              Привяжите свой Telegram — и бот будет присылать лично вам лоты по вашим трекерам.
+              Это касается только вашего профиля на этом устройстве.
+            </p>
+
+            <div className="mt-5 rounded-2xl border border-zinc-800/80 bg-[#101013] p-5">
+              {!myTg ? (
+                <p className="text-[13px] text-zinc-500">Загрузка…</p>
+              ) : !myTg.botReady ? (
+                <div className="flex items-start gap-3">
+                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-amber-500/15 text-amber-400">
+                    <Info className="h-4 w-4" />
+                  </span>
+                  <div>
+                    <p className="text-[13.5px] font-semibold text-white">Бот ещё не подключён</p>
+                    <p className="mt-0.5 text-[12.5px] leading-relaxed text-zinc-500">
+                      Владелец сайта пока не настроил Telegram-бота. Как только настроит — вернитесь сюда и привяжите свой аккаунт.
+                    </p>
+                  </div>
+                </div>
+              ) : myTg.linked ? (
+                <div>
+                  <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2.5 text-[13px] text-emerald-300">
+                    <Check className="h-4 w-4" />
+                    Telegram привязан{myTg.myChat?.name ? `: ${myTg.myChat.name}` : ""}. Уведомления будут приходить сюда.
+                  </div>
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <button
+                      onClick={myTgTest}
+                      className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110"
+                    >
+                      <Send className="h-4 w-4" /> Отправить тест
+                    </button>
+                    <button
+                      onClick={myTgUnlink}
+                      className="flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-800 px-4 py-2 text-[13px] font-medium text-zinc-300 hover:bg-zinc-700"
+                    >
+                      Отвязать
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <ol className="space-y-2 text-[13px] text-zinc-300">
+                    <li>1. Нажмите «Получить код».</li>
+                    <li>2. Откройте бота и нажмите Start (или отправьте <code className="rounded bg-zinc-800 px-1">/start КОД</code>).</li>
+                    <li>3. Вернитесь и нажмите «Я подключился».</li>
+                  </ol>
+                  {!myTgCode ? (
+                    <button
+                      onClick={myTgGetCode}
+                      disabled={myTgBusy}
+                      className="mt-4 flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2.5 text-[13px] font-bold text-black hover:brightness-110 disabled:opacity-50"
+                    >
+                      <Link2 className="h-4 w-4" /> Получить код
+                    </button>
+                  ) : (
+                    <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+                      <div className="text-[12px] text-zinc-500">Ваш код (действует 15 минут):</div>
+                      <div className="mono mt-1 text-2xl font-bold tracking-widest text-[#34d399]">{myTgCode}</div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {myTgDeep && (
+                          <a
+                            href={myTgDeep}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110"
+                          >
+                            <Send className="h-4 w-4" /> Открыть бота
+                          </a>
+                        )}
+                        <button
+                          onClick={myTgCheck}
+                          disabled={myTgBusy}
+                          className="flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-800 px-4 py-2 text-[13px] font-medium text-zinc-300 hover:bg-zinc-700 disabled:opacity-50"
+                        >
+                          <RefreshCw className={`h-3.5 w-3.5 ${myTgBusy ? "animate-spin" : ""}`} /> Я подключился
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {view === "admin" && !isAdmin && (
+          <div className="mx-auto mt-10 max-w-sm anim-fade-up">
+            <div className="rounded-2xl border border-zinc-800/80 bg-[#101013] p-6">
+              <h1 className="flex items-center gap-2 text-lg font-bold text-white">
+                <SettingsIcon className="h-5 w-5 text-[#34d399]" /> Вход в админ-панель
+              </h1>
+              {adminConfigured ? (
+                <>
+                  <p className="mt-1 text-[12.5px] text-zinc-500">
+                    Введите пароль администратора (переменная ADMIN_PASSWORD на хостинге).
+                  </p>
+                  <input
+                    type="password"
+                    value={adminPassword}
+                    onChange={(e) => { setAdminPassword(e.target.value); setAdminError(""); }}
+                    onKeyDown={(e) => { if (e.key === "Enter") adminLogin(); }}
+                    placeholder="Пароль"
+                    className="mt-3 w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-[14px] text-white outline-none focus:border-[#34d399]/60"
+                  />
+                  {adminError && <p className="mt-2 text-[12px] text-red-400">{adminError}</p>}
+                  <button
+                    onClick={adminLogin}
+                    className="mt-3 w-full rounded-xl bg-[#34d399] px-4 py-2.5 text-[13px] font-bold text-black hover:brightness-110"
+                  >
+                    Войти
+                  </button>
+                </>
+              ) : (
+                <p className="mt-2 text-[12.5px] leading-relaxed text-amber-300/80">
+                  Админ-панель отключена: на хостинге не задана переменная ADMIN_PASSWORD.
+                  Задайте её (16+ символов) и перезапустите сайт.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {view === "admin" && isAdmin && (
+          <div className="mt-5 anim-fade-up">
+            <h1 className="flex items-center justify-between gap-2 text-xl font-bold text-white">
+              <span className="flex items-center gap-2">
+                <SettingsIcon className="h-5 w-5 text-[#34d399]" /> Админ-панель
+              </span>
+              <button onClick={adminLogout} className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-[12px] font-medium text-zinc-300 hover:bg-zinc-700">
+                Выйти
+              </button>
             </h1>
             <p className="mt-0.5 text-[13px] text-zinc-500">
               Telegram-уведомления, фоновый трекинг 24/7 и адрес сайта.
@@ -1797,97 +2077,14 @@ export default function AuctionApp() {
                         onClick={() => saveSettings({ telegram_enabled: settings?.telegram_enabled === "0" ? "1" : "0" }, "Telegram-уведомления обновлены")}
                         className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12.5px] font-medium ${settings?.telegram_enabled !== "0" ? "bg-emerald-500/15 text-emerald-300" : "bg-zinc-800 text-zinc-400"}`}
                       >
-                        {settings?.telegram_enabled !== "0" ? <><Check className="h-3.5 w-3.5" /> Включены</> : <><X className="h-3.5 w-3.5" /> Выключены</>}
-                      </button>
-                      <button
-                        onClick={() => testTg(null)}
-                        disabled={tgChats.filter((c) => c.isActive).length === 0}
-                        className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-[12.5px] font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
-                      >
-                        Тест всем
+                        {settings?.telegram_enabled !== "0" ? <><Check className="h-3.5 w-3.5" /> Уведомления включены</> : <><X className="h-3.5 w-3.5" /> Уведомления выключены</>}
                       </button>
                     </div>
 
-                    <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
-                      <p className="text-[12px] font-medium text-zinc-300">Как подключить свой Telegram</p>
-                      <p className="mt-0.5 text-[11.5px] leading-relaxed text-zinc-500">
-                        Каждому человеку нужен свой код — делать это надо один раз. Код одноразовый и сгорает через 15 минут.
-                      </p>
-                      <ol className="mt-1.5 list-decimal space-y-1 pl-5 text-[11.5px] leading-relaxed text-zinc-400">
-                        <li>Нажмите «Получить код» — появится код из 6 букв и ссылка.</li>
-                        <li>Нажмите «Открыть бота» и там кнопку Start. Если боту уже писали Start раньше — просто отправьте ему сообщение вида <code className="mono rounded bg-zinc-800 px-1">/start ВАШКОД</code>.</li>
-                        <li>Вернитесь сюда и нажмите «Проверить привязку» — человек появится в списке ниже.</li>
-                        <li>Для друга нажмите «Получить код» ещё раз — у него будет свой.</li>
-                      </ol>
-                      <div className="mt-2 flex flex-wrap items-center gap-2">
-                        <button
-                          onClick={genLinkCode}
-                          disabled={tgBusy}
-                          className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2 text-[12.5px] font-bold text-black hover:brightness-110 disabled:opacity-50"
-                        >
-                          <KeyRound className="h-3.5 w-3.5" /> {tgBusy ? "…" : "Получить код"}
-                        </button>
-                        <button
-                          onClick={pollTgNow}
-                          disabled={tgBusy}
-                          className="rounded-xl border border-zinc-700 bg-zinc-800 px-4 py-2 text-[12.5px] font-medium text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
-                        >
-                          Проверить привязку
-                        </button>
-                      </div>
-                      {linkCode && (
-                        <div className="mt-2.5 flex flex-wrap items-center gap-2 rounded-xl border border-[#34d399]/25 bg-[#34d399]/5 p-3 anim-fade-up">
-                          <span className="mono text-xl font-extrabold tracking-[0.2em] text-[#34d399]">{linkCode}</span>
-                          <button onClick={() => copyText(linkCode, "Код скопирован")} className="rounded-lg border border-zinc-700 bg-zinc-800 p-1.5 text-zinc-300 hover:text-white" title="Скопировать код">
-                            <Copy className="h-3.5 w-3.5" />
-                          </button>
-                          {linkDeep && (
-                            <a href={linkDeep} target="_blank" rel="noreferrer" className="flex items-center gap-1 rounded-lg bg-sky-500/15 px-3 py-1.5 text-[12px] font-medium text-sky-300 hover:bg-sky-500/25">
-                              <Link2 className="h-3.5 w-3.5" /> Открыть бота
-                            </a>
-                          )}
-                        </div>
-                      )}
-                    </div>
-
-                    <div>
-                      <p className="mb-1.5 text-[12px] font-medium text-zinc-400">
-                        Привязанные ({tgChats.filter((c) => c.isActive).length})
-                      </p>
-                      {tgChats.length === 0 ? (
-                        <p className="rounded-xl border border-dashed border-zinc-800 px-3 py-3 text-center text-[12px] text-zinc-600">
-                          Пока никого — получите код выше и отправьте его боту
-                        </p>
-                      ) : (
-                        <div className="space-y-1.5">
-                          {tgChats.map((c) => (
-                            <div key={c.chatId} className={`flex items-center gap-2 rounded-xl border px-3 py-2 ${c.isActive ? "border-zinc-800 bg-zinc-900/40" : "border-zinc-800/60 opacity-50"}`}>
-                              <span className={`grid h-7 w-7 shrink-0 place-items-center rounded-full text-[11px] font-bold ${c.isActive ? "bg-sky-500/20 text-sky-300" : "bg-zinc-800 text-zinc-500"}`}>
-                                {(c.name || "?").slice(0, 1).toUpperCase()}
-                              </span>
-                              <span className="min-w-0 flex-1">
-                                <span className="block truncate text-[12.5px] font-medium text-zinc-200">
-                                  {c.name || c.chatId} {c.username ? <span className="text-zinc-500">@{c.username}</span> : null}
-                                </span>
-                                <span className="block text-[10.5px] text-zinc-600">
-                                  {c.isActive ? `привязан ${timeAgo(c.linkedAt)}` : "отключён"}
-                                </span>
-                              </span>
-                              {c.isActive && (
-                                <>
-                                  <button onClick={() => testTg(c.chatId)} className="rounded-lg px-2 py-1 text-[11.5px] text-zinc-400 hover:bg-zinc-800 hover:text-white">
-                                    Тест
-                                  </button>
-                                  <button onClick={() => unlinkTg(c.chatId)} className="rounded-lg p-1.5 text-zinc-500 hover:bg-red-500/10 hover:text-red-400" title="Отвязать">
-                                    <Trash2 className="h-3.5 w-3.5" />
-                                  </button>
-                                </>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
+                    <p className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 text-[11.5px] leading-relaxed text-zinc-400">
+                      Бот подключён. Каждый пользователь привязывает свой Telegram сам —
+                      на вкладке «Telegram» в шапке сайта. Лоты приходят лично тому, чей трекер сработал.
+                    </p>
 
                     <button onClick={deleteTgToken} className="text-[12px] text-zinc-600 hover:text-red-400">
                       Удалить токен бота
@@ -2168,47 +2365,27 @@ export default function AuctionApp() {
               </div>
 
               <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
-                <div className="mb-2 flex items-center gap-1.5 text-[12.5px] font-semibold text-zinc-200">
+                <div className="mb-1.5 flex items-center gap-1.5 text-[12.5px] font-semibold text-zinc-200">
                   <Send className="h-3.5 w-3.5 text-sky-400" /> Уведомления в Telegram
                 </div>
-                {tgChats.filter((c) => c.isActive).length === 0 ? (
-                  <button
-                    onClick={() => { setShowTrackerModal(false); setView("admin"); }}
-                    className="w-full rounded-lg border border-dashed border-zinc-700 px-3 py-2 text-[12px] leading-relaxed text-zinc-400 hover:border-sky-500/50 hover:text-sky-300"
-                  >
-                    Привяжите Telegram в настройках — уведомления будут приходить, даже когда сайт закрыт →
-                  </button>
+                {myTg?.linked ? (
+                  <p className="text-[12px] leading-relaxed text-emerald-300/90">
+                    <Check className="mr-1 inline h-3.5 w-3.5" />
+                    Ваш Telegram привязан. Найденные лоты придут лично вам.
+                  </p>
                 ) : (
-                  <div className="space-y-1.5">
-                    <label className="flex cursor-pointer items-center gap-2 rounded-lg bg-zinc-900/70 px-2.5 py-1.5 text-[12.5px] text-zinc-200">
-                      <input
-                        type="checkbox"
-                        checked={tgSelected === null}
-                        onChange={() => setTgSelected(tgSelected === null ? tgChats.filter((c) => c.isActive).map((c) => c.chatId) : null)}
-                        className="h-3.5 w-3.5 accent-[#34d399]"
-                      />
-                      Всем привязанным ({tgChats.filter((c) => c.isActive).length})
-                    </label>
-                    {tgSelected !== null && tgChats.filter((c) => c.isActive).map((c) => (
-                      <label key={c.chatId} className="ml-4 flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1 text-[12px] text-zinc-300 hover:bg-zinc-900/70">
-                        <input
-                          type="checkbox"
-                          checked={tgSelected.includes(c.chatId)}
-                          onChange={() => setTgSelected((prev) => {
-                            const arr = prev || [];
-                            return arr.includes(c.chatId) ? arr.filter((x) => x !== c.chatId) : [...arr, c.chatId];
-                          })}
-                          className="h-3.5 w-3.5 accent-[#34d399]"
-                        />
-                        <span className="truncate">{c.name || c.chatId} {c.username ? <span className="text-zinc-500">@{c.username}</span> : null}</span>
-                      </label>
-                    ))}
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { setShowTrackerModal(false); setView("telegram"); }}
+                    className="w-full rounded-lg border border-dashed border-zinc-700 px-3 py-2 text-left text-[12px] leading-relaxed text-zinc-400 hover:border-sky-500/50 hover:text-sky-300"
+                  >
+                    Привяжите свой Telegram на вкладке «Telegram» — тогда лоты будут приходить вам в личку →
+                  </button>
                 )}
               </div>
 
               <p className="rounded-xl bg-zinc-900/60 px-3 py-2 text-[11.5px] leading-relaxed text-zinc-500">
-                💡 Сервер проверяет аукцион каждые {scheduler?.interval || 60} сек — уведомления в Telegram приходят, даже когда сайт закрыт. Открытая вкладка проверяет чаще (каждые {checkInterval} сек) + звук и пуши в браузере.
+                💡 Проверка идёт на сервере автоматически. Уведомления приходят в ваш Telegram, даже когда сайт закрыт. Первая проверка трекера просто запоминает текущие лоты, а дальше сообщает только про новые.
               </p>
             </div>
 

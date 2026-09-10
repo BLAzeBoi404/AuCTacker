@@ -5,6 +5,7 @@ import { ExboApiError, fetchLots, type NormalizedLot } from "./exbo";
 import { QUALITY_NAMES } from "./constants";
 import { getSetting } from "./settings";
 import { getActiveChats, sendTelegramMessage, esc } from "./telegram";
+import { telegramChats } from "@/db/schema";
 
 export interface CheckMatch {
   trackerId: number;
@@ -136,6 +137,15 @@ async function check(source: string): Promise<CheckResult> {
   const telegramEnabled = ((await getSetting("telegram_enabled")) ?? "1") === "1";
   const siteUrl = ((await getSetting("site_url")) || "").replace(/\/$/, "");
   const activeChats = telegramEnabled ? await getActiveChats() : [];
+  // Карта: профиль пользователя -> его активные Telegram-чаты.
+  // Каждый трекер шлёт уведомления только владельцу.
+  const chatsByOwner = new Map<string, { chatId: string; name: string | null }[]>();
+  for (const chat of activeChats) {
+    if (!chat.ownerKey) continue;
+    const list = chatsByOwner.get(chat.ownerKey) || [];
+    list.push({ chatId: chat.chatId, name: chat.name });
+    chatsByOwner.set(chat.ownerKey, list);
+  }
 
   for (const [key, group] of groups) {
     const [region, itemId] = key.split("|");
@@ -157,10 +167,10 @@ async function check(source: string): Promise<CheckResult> {
       const seen = new Set(Array.isArray(tracker.lastSeenLotIds) ? tracker.lastSeenLotIds : []);
       const firstRun = tracker.lastCheckedAt === null && seen.size === 0;
       const currentIds = snapshot.lots.map((lot) => lot.id);
-      const targets = (() => {
-        const wanted = Array.isArray(tracker.notifyChatIds) ? tracker.notifyChatIds : [];
-        return wanted.length ? activeChats.filter((chat) => wanted.includes(chat.chatId)) : activeChats;
-      })();
+      // Шлём только владельцу трекера. Старые трекеры без owner_key (общие) — всем, как раньше.
+      const targets = tracker.ownerKey
+        ? (chatsByOwner.get(tracker.ownerKey) || [])
+        : activeChats;
 
       const matching = snapshot.lots.filter((lot) => {
         const price = lot.buyoutPrice || lot.startPrice || 0;
@@ -224,6 +234,7 @@ async function check(source: string): Promise<CheckResult> {
           newCount++;
 
           await db.insert(notifications).values({
+            ownerKey: tracker.ownerKey,
             trackerId: tracker.id,
             itemId: tracker.itemId,
             itemName: tracker.itemName,

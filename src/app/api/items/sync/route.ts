@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { syncItemsFromGithub } from "@/lib/exbo";
 import { ensureSchema } from "@/lib/ensure-schema";
+import { isAdmin } from "@/lib/identity";
 
 export const dynamic = "force-dynamic";
 // Синхронизация тянет мегабайты с GitHub + пишет тысячи строк:
@@ -8,6 +9,9 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
 export async function POST() {
+  if (!(await isAdmin())) {
+    return NextResponse.json({ success: false, error: "admin_only" }, { status: 403 });
+  }
   try {
     try {
       await ensureSchema();

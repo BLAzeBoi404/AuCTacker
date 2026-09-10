@@ -25,6 +25,7 @@ export const items = pgTable("items", {
 // Трекеры слежки за лотами
 export const trackers = pgTable("trackers", {
   id: serial("id").primaryKey(),
+  ownerKey: text("owner_key"), // профиль пользователя (браузер), NULL = старые общие
   itemId: text("item_id").notNull(),
   itemName: text("item_name").notNull(),
   itemIcon: text("item_icon"),
@@ -53,6 +54,7 @@ export const trackers = pgTable("trackers", {
 // Уведомления о найденных лотах
 export const notifications = pgTable("notifications", {
   id: serial("id").primaryKey(),
+  ownerKey: text("owner_key"), // чей трекер сработал
   trackerId: integer("tracker_id"),
   itemId: text("item_id").notNull(),
   itemName: text("item_name").notNull(),
@@ -77,11 +79,19 @@ export const notifications = pgTable("notifications", {
 // Привязанные Telegram-чаты для уведомлений
 export const telegramChats = pgTable("telegram_chats", {
   chatId: text("chat_id").primaryKey(),
+  ownerKey: text("owner_key"), // чей это чат (профиль пользователя)
   name: text("name"),
   username: text("username"),
   isActive: boolean("is_active").notNull().default(true),
   linkedAt: timestamp("linked_at").defaultNow(),
   lastMessageAt: timestamp("last_message_at"),
+});
+
+// Одноразовые коды привязки Telegram → профиль пользователя
+export const telegramCodes = pgTable("telegram_codes", {
+  code: text("code").primaryKey(),
+  ownerKey: text("owner_key").notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
 });
 
 // Настройки приложения (ключ-значение)

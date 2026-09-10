@@ -1,6 +1,6 @@
 import { db } from "@/db";
-import { telegramChats, trackers } from "@/db/schema";
-import { eq } from "drizzle-orm";
+import { telegramChats, trackers, telegramCodes } from "@/db/schema";
+import { and, eq, lt } from "drizzle-orm";
 import { getSetting, setSetting } from "./settings";
 
 export async function getBotToken(): Promise<string | null> {
@@ -86,46 +86,50 @@ export async function sendTelegramMessage(
 }
 
 export async function getActiveChats(): Promise<
-  { chatId: string; name: string | null }[]
+  { chatId: string; name: string | null; ownerKey: string | null }[]
 > {
   try {
     const rows = await db.select().from(telegramChats);
     return rows
       .filter((r) => r.isActive)
-      .map((r) => ({ chatId: r.chatId, name: r.name }));
+      .map((r) => ({ chatId: r.chatId, name: r.name, ownerKey: r.ownerKey }));
   } catch {
     return [];
   }
-}
-
-interface PendingCode {
-  code: string;
-  createdAt: number;
 }
 
 const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+const CODE_TTL_MS = 15 * 60 * 1000;
 
-async function getPendingCodes(): Promise<PendingCode[]> {
-  try {
-    const raw = await getSetting("telegram_link_codes");
-    const arr: PendingCode[] = raw ? (JSON.parse(raw) as PendingCode[]) : [];
-    const now = Date.now();
-    return arr.filter((c) => now - c.createdAt < 15 * 60 * 1000);
-  } catch {
-    return [];
-  }
-}
+// Каждый пользователь (профиль браузера) получает свой одноразовый код.
+// Код хранится в БД вместе с ownerKey, чтобы Telegram-чат привязался к нужному профилю.
+export async function createLinkCode(ownerKey: string): Promise<string> {
+  // Чистим просроченные коды
+  await db
+    .delete(telegramCodes)
+    .where(lt(telegramCodes.createdAt, new Date(Date.now() - CODE_TTL_MS)));
 
-// Каждый пользователь получает свой код — можно привязывать несколько человек
-export async function createLinkCode(): Promise<string> {
-  const codes = await getPendingCodes();
   let code = "";
   for (let i = 0; i < 6; i++) {
     code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
   }
-  codes.push({ code, createdAt: Date.now() });
-  await setSetting("telegram_link_codes", JSON.stringify(codes.slice(-10)));
+  await db.insert(telegramCodes).values({ code, ownerKey, createdAt: new Date() });
   return code;
+}
+
+// Возвращает ownerKey по коду, если код валиден и не просрочен
+async function consumeLinkCode(code: string): Promise<string | null> {
+  const [row] = await db
+    .select()
+    .from(telegramCodes)
+    .where(eq(telegramCodes.code, code));
+  if (!row) return null;
+  if (row.createdAt && Date.now() - row.createdAt.getTime() > CODE_TTL_MS) {
+    await db.delete(telegramCodes).where(eq(telegramCodes.code, code));
+    return null;
+  }
+  await db.delete(telegramCodes).where(eq(telegramCodes.code, code));
+  return row.ownerKey;
 }
 
 interface TgUpdate {
@@ -174,37 +178,40 @@ export async function pollTelegramUpdates(): Promise<{
       if (text.startsWith("/start")) {
         const parts = text.split(/\s+/);
         const code = (parts[1] || "").toUpperCase();
-        const codes = await getPendingCodes();
-        if (code && codes.some((c) => c.code === code)) {
+        const ownerKey = code ? await consumeLinkCode(code) : null;
+        if (ownerKey) {
+          // Один профиль = один активный чат. Отвязываем старые чаты этого профиля.
+          await db
+            .update(telegramChats)
+            .set({ isActive: false })
+            .where(eq(telegramChats.ownerKey, ownerKey));
           await db
             .insert(telegramChats)
             .values({
               chatId,
+              ownerKey,
               name,
               username: msg.chat.username || null,
               isActive: true,
             })
             .onConflictDoUpdate({
               target: telegramChats.chatId,
-              set: { name, isActive: true, linkedAt: new Date() },
+              set: { ownerKey, name, isActive: true, linkedAt: new Date() },
             });
-          await setSetting(
-            "telegram_link_codes",
-            JSON.stringify(codes.filter((c) => c.code !== code))
-          );
           linked.push(chatId);
           await sendTelegramMessage(
             chatId,
-            `✅ <b>Telegram привязан!</b>\n\nСюда будут приходить уведомления о найденных лотах.` +
+            `✅ <b>Telegram привязан!</b>\n\nСюда будут приходить уведомления по вашим трекерам.` +
               (siteUrl ? `\n\nСайт: ${esc(siteUrl)}` : "")
           );
         } else {
           await sendTelegramMessage(
             chatId,
-            `👋 <b>AucTracker</b>\n\nЧтобы привязать уведомления:\n` +
-              `1. Откройте сайт → Настройки → Telegram\n` +
-              `2. Нажмите «Получить код»\n` +
-              `3. Отправьте сюда: <code>/start КОД</code>`
+            `👋 <b>AucTracker</b>\n\nЧтобы получать уведомления:\n` +
+              `1. Откройте сайт → Telegram\n` +
+              `2. Нажмите «Привязать Telegram»\n` +
+              `3. Отправьте сюда: <code>/start КОД</code>\n\n` +
+              `Код действует 15 минут.`
           );
         }
       } else if (text === "/stop") {
@@ -217,11 +224,25 @@ export async function pollTelegramUpdates(): Promise<{
           `🔕 Уведомления отключены.\nЧтобы включить снова — отправьте <code>/start КОД</code> с новым кодом с сайта.`
         );
       } else if (text === "/status") {
-        const all = await db.select().from(trackers);
-        await sendTelegramMessage(
-          chatId,
-          `📊 <b>AucTracker</b>\nТрекеров: ${all.length} (активно: ${all.filter((t) => t.enabled).length})\nЧат: <code>${esc(chatId)}</code>`
-        );
+        const [chat] = await db
+          .select()
+          .from(telegramChats)
+          .where(eq(telegramChats.chatId, chatId));
+        if (chat?.ownerKey) {
+          const mine = await db
+            .select()
+            .from(trackers)
+            .where(eq(trackers.ownerKey, chat.ownerKey));
+          await sendTelegramMessage(
+            chatId,
+            `📊 <b>AucTracker</b>\nВаших трекеров: ${mine.length} (активно: ${mine.filter((t) => t.enabled).length})`
+          );
+        } else {
+          await sendTelegramMessage(
+            chatId,
+            `Этот чат не привязан. Откройте сайт → Telegram → «Привязать Telegram».`
+          );
+        }
       } else {
         await sendTelegramMessage(
           chatId,

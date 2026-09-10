@@ -91,6 +91,32 @@ export async function ensureSchema(): Promise<void> {
         updated_at timestamp DEFAULT now()
       );
     `);
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS telegram_codes (
+        code text PRIMARY KEY,
+        owner_key text NOT NULL,
+        created_at timestamp DEFAULT now()
+      );
+    `);
+    // Профили пользователей: у каждого браузера свой owner_key
+    await db.execute(sql`
+      ALTER TABLE trackers ADD COLUMN IF NOT EXISTS owner_key text;
+    `);
+    await db.execute(sql`
+      ALTER TABLE telegram_chats ADD COLUMN IF NOT EXISTS owner_key text;
+    `);
+    await db.execute(sql`
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS owner_key text;
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS trackers_owner_idx ON trackers (owner_key);
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS telegram_chats_owner_idx ON telegram_chats (owner_key);
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS notifications_owner_idx ON notifications (owner_key);
+    `);
     // Мягкая миграция: колонка notify_chat_ids добавлена позже —
     // на старых базах её может не быть.
     await db.execute(sql`
