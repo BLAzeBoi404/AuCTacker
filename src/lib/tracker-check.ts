@@ -1,7 +1,7 @@
 import { db } from "@/db";
 import { trackers, notifications } from "@/db/schema";
-import { eq, sql } from "drizzle-orm";
-import { fetchLots, type NormalizedLot } from "./exbo";
+import { and, asc, eq, gt, isNull, lte, sql } from "drizzle-orm";
+import { ExboApiError, fetchLots, type NormalizedLot } from "./exbo";
 import { QUALITY_NAMES } from "./constants";
 import { getSetting } from "./settings";
 import { getActiveChats, sendTelegramMessage, esc } from "./telegram";
@@ -27,199 +27,252 @@ export interface CheckResult {
   totalMatches: number;
   initialized: number;
   telegramSent: number;
+  failed: number;
+  apiLots: number;
+  errors: string[];
 }
 
-// Единый движок проверки трекеров. Используется планировщиком, cron-пингом и сайтом.
-// Уведомления (в т.ч. Telegram) — только по НОВЫМ лотам.
-// Первая проверка трекера — тихая инициализация без уведомлений (защита от спама).
-export async function runTrackerCheck(source: string): Promise<CheckResult> {
-  const empty: CheckResult = {
+let activeCheck: Promise<CheckResult> | null = null;
+
+function priceLabel(min: number, max: number): string {
+  if (min > 0 && max > 0) return `${min.toLocaleString("ru-RU")}–${max.toLocaleString("ru-RU")} ₽`;
+  if (min > 0) return `от ${min.toLocaleString("ru-RU")} ₽`;
+  if (max > 0) return `до ${max.toLocaleString("ru-RU")} ₽`;
+  return "любая цена";
+}
+
+async function fetchAllLots(itemId: string, region: string): Promise<{ lots: NormalizedLot[]; total: number }> {
+  const result: NormalizedLot[] = [];
+  let total = 0;
+  for (let offset = 0; offset < 2000; offset += 100) {
+    const page = await fetchLots(itemId, region, 100, offset);
+    total = page.total;
+    result.push(...page.lots);
+    if (page.lots.length < 100 || result.length >= total) break;
+  }
+  if (total > result.length) {
+    throw new ExboApiError(`EXBO сообщил ${total} лотов, но удалось получить только ${result.length}`, 502);
+  }
+  return { lots: [...new Map(result.map((lot) => [lot.id, lot])).values()], total };
+}
+
+async function deliverPending(
+  chats: Awaited<ReturnType<typeof getActiveChats>>,
+  siteUrl: string,
+): Promise<number> {
+  const pending = await db.select().from(notifications).where(and(
+    isNull(notifications.sentAt),
+    lte(notifications.retryAt, new Date()),
+    gt(notifications.createdAt, new Date(Date.now() - 24 * 60 * 60 * 1000)),
+  )).orderBy(asc(notifications.id)).limit(20);
+
+  let delivered = 0;
+  for (const notification of pending) {
+    const requested = Array.isArray(notification.targetChatIds) && notification.targetChatIds.length
+      ? notification.targetChatIds
+      : chats.map((chat) => chat.chatId);
+    const sent = new Set(Array.isArray(notification.sentChatIds) ? notification.sentChatIds : []);
+    let lastError: string | null = null;
+
+    for (const chatId of requested) {
+      if (sent.has(chatId)) continue;
+      const chat = chats.find((candidate) => candidate.chatId === chatId);
+      if (!chat) {
+        lastError = "Telegram-чат отключён или не найден";
+        continue;
+      }
+      const url = siteUrl ? `${siteUrl}/?item=${encodeURIComponent(notification.itemId)}` : undefined;
+      const html =
+        `🎯 <b>Новый лот: ${esc(notification.itemName)}</b>\n\n`
+        + `Цена: <b>${notification.price.toLocaleString("ru-RU")} ₽</b>\n`
+        + `${esc(notification.qualityName || "Обычный")} • +${notification.upgrade}\n`
+        + `Регион: ${esc(notification.region)}\n`
+        + `Источник: EXBO EAPI`;
+      if (await sendTelegramMessage(chatId, html, url)) {
+        sent.add(chatId);
+        delivered++;
+      } else {
+        lastError = "Telegram временно не принял сообщение";
+      }
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+
+    const complete = requested.length > 0 && requested.every((chatId) => sent.has(chatId));
+    const attempts = notification.attempts + 1;
+    await db.update(notifications).set({
+      targetChatIds: requested,
+      sentChatIds: [...sent],
+      attempts,
+      sentAt: complete ? new Date() : null,
+      retryAt: complete ? new Date() : new Date(Date.now() + Math.min(60 * 60 * 1000, 30000 * 2 ** Math.min(attempts, 6))),
+      deliveryError: complete ? null : (lastError || "Нет активного Telegram-чата"),
+    }).where(eq(notifications.id, notification.id));
+  }
+  return delivered;
+}
+
+async function check(source: string): Promise<CheckResult> {
+  const result: CheckResult = {
     checked: 0,
     matches: [],
     totalMatches: 0,
     initialized: 0,
     telegramSent: 0,
+    failed: 0,
+    apiLots: 0,
+    errors: [],
   };
-  let all: (typeof trackers.$inferSelect)[];
-  try {
-    all = await db.select().from(trackers);
-  } catch (e) {
-    console.error(`tracker check [${source}] db failed:`, e);
-    return empty;
-  }
-  const enabled = all.filter((t) => t.enabled);
-  if (enabled.length === 0) return empty;
 
-  // Группируем по предмет+регион, чтобы не дублировать запросы к EAPI
+  const all = await db.select().from(trackers);
+  const enabled = all.filter((tracker) => tracker.enabled);
+  if (!enabled.length) return result;
+
   const groups = new Map<string, typeof enabled>();
-  for (const t of enabled) {
-    const key = `${t.itemId}|${t.region}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(t);
+  for (const tracker of enabled) {
+    const key = `${tracker.region}|${tracker.itemId}`;
+    groups.set(key, [...(groups.get(key) || []), tracker]);
   }
 
-  const tgEnabled = ((await getSetting("telegram_enabled")) ?? "1") === "1";
+  const telegramEnabled = ((await getSetting("telegram_enabled")) ?? "1") === "1";
   const siteUrl = ((await getSetting("site_url")) || "").replace(/\/$/, "");
-  const activeChats = tgEnabled ? await getActiveChats() : [];
+  const activeChats = telegramEnabled ? await getActiveChats() : [];
 
-  const matches: CheckMatch[] = [];
-  const firstRunWithMatches = new Set<number>();
-  const tgSentPerTracker = new Map<number, number>();
-  let telegramSent = 0;
-  let notifInserted = 0;
-
-  for (const [key, list] of groups) {
-    const [itemId, region] = key.split("|");
-    // До 200 лотов двумя страницами (EAPI отдаёт максимум 100 за запрос)
-    let lots: NormalizedLot[] = [];
+  for (const [key, group] of groups) {
+    const [region, itemId] = key.split("|");
+    let snapshot: { lots: NormalizedLot[]; total: number };
     try {
-      for (const off of [0, 100]) {
-        const r = await fetchLots(itemId, region, 100, off);
-        lots = lots.concat(r.lots);
-        if (r.lots.length < 100) break;
+      snapshot = await fetchAllLots(itemId, region);
+      result.apiLots += snapshot.total;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "EXBO EAPI недоступен";
+      result.failed += group.length;
+      result.errors.push(`${group[0].itemName}: ${message}`);
+      for (const tracker of group) {
+        await db.update(trackers).set({ lastCheckedAt: new Date(), lastError: message }).where(eq(trackers.id, tracker.id));
       }
-    } catch (e) {
-      console.error(`tracker check [${source}] lots failed for ${itemId}:`, e);
       continue;
     }
 
-    for (const tracker of list) {
-      const seen: string[] = Array.isArray(tracker.lastSeenLotIds)
-        ? tracker.lastSeenLotIds
-        : [];
-      const isFirstRun = tracker.lastCheckedAt === null && seen.length === 0;
-      const seenSet = new Set(seen);
-      const currentIds: string[] = [];
-      let newCount = 0;
+    for (const tracker of group) {
+      const seen = new Set(Array.isArray(tracker.lastSeenLotIds) ? tracker.lastSeenLotIds : []);
+      const firstRun = tracker.lastCheckedAt === null && seen.size === 0;
+      const currentIds = snapshot.lots.map((lot) => lot.id);
+      const targets = (() => {
+        const wanted = Array.isArray(tracker.notifyChatIds) ? tracker.notifyChatIds : [];
+        return wanted.length ? activeChats.filter((chat) => wanted.includes(chat.chatId)) : activeChats;
+      })();
 
-      const wanted: string[] = Array.isArray(tracker.notifyChatIds)
-        ? tracker.notifyChatIds
-        : [];
-      // Пустой список = слать всем привязанным чатам
-      const targets =
-        wanted.length > 0
-          ? activeChats.filter((c) => wanted.includes(c.chatId))
-          : activeChats;
-
-      for (const lot of lots) {
-        currentIds.push(lot.id);
+      const matching = snapshot.lots.filter((lot) => {
         const price = lot.buyoutPrice || lot.startPrice || 0;
+        const upgradeMatches = tracker.upgradeMode === "any"
+          || (tracker.upgradeMode === "exact" && lot.upgrade === tracker.targetUpgrade)
+          || (tracker.upgradeMode === "min" && lot.upgrade >= tracker.targetUpgrade);
+        return upgradeMatches
+          && (tracker.targetQuality === -1 || lot.quality === tracker.targetQuality)
+          && (tracker.maxPrice === 0 || (price > 0 && price <= tracker.maxPrice))
+          && (tracker.minPrice === 0 || (price > 0 && price >= tracker.minPrice));
+      });
 
-        let matchUp = true;
-        if (tracker.upgradeMode === "exact")
-          matchUp = lot.upgrade === tracker.targetUpgrade;
-        else if (tracker.upgradeMode === "min")
-          matchUp = lot.upgrade >= tracker.targetUpgrade;
-        // "any" -> всегда true
+      result.checked++;
+      result.totalMatches += matching.length;
+      if (firstRun) result.initialized++;
 
-        const matchQlt =
-          tracker.targetQuality === -1 || lot.quality === tracker.targetQuality;
-        const matchMax =
-          tracker.maxPrice === 0 || (price > 0 && price <= tracker.maxPrice);
-        const matchMin =
-          tracker.minPrice === 0 || (price > 0 && price >= tracker.minPrice);
-        if (!(matchUp && matchQlt && matchMax && matchMin)) continue;
-
-        const isNew = !seenSet.has(lot.id);
-        matches.push({
-          trackerId: tracker.id,
-          itemId: tracker.itemId,
-          itemName: tracker.itemName,
-          itemIcon: tracker.itemIcon,
-          region: tracker.region,
-          lotId: lot.id,
-          price,
-          upgrade: lot.upgrade,
-          quality: lot.quality,
-          qualityName: QUALITY_NAMES[lot.quality] ?? "Обычный",
-          endTime: lot.endTime,
-          isNew,
-        });
-        if (!isNew) continue;
-        newCount++;
-        if (isFirstRun) continue; // тихая инициализация — запоминаем, но не шумим
-
-        if (notifInserted < 30) {
-          try {
-            await db.insert(notifications).values({
-              trackerId: tracker.id,
-              itemId: tracker.itemId,
-              itemName: tracker.itemName,
-              itemIcon: tracker.itemIcon,
-              region: tracker.region,
-              lotId: lot.id,
-              price,
-              upgrade: lot.upgrade,
-              quality: lot.quality,
-              qualityName: QUALITY_NAMES[lot.quality] ?? "Обычный",
-              message: `+${lot.upgrade} • ${QUALITY_NAMES[lot.quality] ?? ""} • ${price.toLocaleString("ru-RU")} ₽`,
-            });
-            notifInserted++;
-          } catch {
-              /* ignore */
+      let reportSent = tracker.initialReportSent;
+      if (!reportSent && targets.length) {
+        const quality = tracker.targetQuality === -1 ? "любая редкость" : QUALITY_NAMES[tracker.targetQuality];
+        const upgrade = tracker.upgradeMode === "any"
+          ? "любая заточка"
+          : tracker.upgradeMode === "min"
+            ? `от +${tracker.targetUpgrade}`
+            : `точно +${tracker.targetUpgrade}`;
+        const report =
+          `✅ <b>Трекер активен: ${esc(tracker.itemName)}</b>\n\n`
+          + `Источник: официальный EXBO EAPI\n`
+          + `Регион: ${esc(tracker.region)}\n`
+          + `EXBO вернул лотов: <b>${snapshot.total}</b>\n`
+          + `Под условия подходит: <b>${matching.length}</b>\n`
+          + `Условия: ${esc(upgrade)}, ${esc(quality)}, ${esc(priceLabel(tracker.minPrice, tracker.maxPrice))}\n\n`
+          + `Если лот уже виден в игре, но его нет на сайте, официальный API ещё не передал его. AuCTracker не может увидеть лот раньше EXBO.`;
+        for (const target of targets) {
+          if (await sendTelegramMessage(target.chatId, report)) {
+            result.telegramSent++;
+            reportSent = true;
           }
-        }
-
-        // Telegram: максимум 5 сообщений на трекер за проверку (защита от флуда)
-        const sentForTracker = tgSentPerTracker.get(tracker.id) || 0;
-        if (targets.length > 0 && sentForTracker < 5) {
-          const qn = QUALITY_NAMES[lot.quality] ?? "";
-          const itemUrl = siteUrl
-            ? `${siteUrl}/?item=${encodeURIComponent(tracker.itemId)}`
-            : undefined;
-          const html =
-            `🎯 <b>${esc(tracker.itemName)}</b>\n` +
-            `+${lot.upgrade} • ${esc(qn)} • <b>${price.toLocaleString("ru-RU")} ₽</b>\n` +
-            `Регион: ${esc(tracker.region)}`;
-          for (const t of targets) {
-            try {
-              const ok = await sendTelegramMessage(t.chatId, html, itemUrl);
-              if (ok) telegramSent++;
-            } catch {
-              /* ignore */
-            }
-          }
-          tgSentPerTracker.set(tracker.id, sentForTracker + 1);
         }
       }
 
-      if (isFirstRun && newCount > 0) firstRunWithMatches.add(tracker.id);
+      let newCount = 0;
+      if (!firstRun) {
+        for (const lot of matching) {
+          if (seen.has(lot.id)) continue;
+          const price = lot.buyoutPrice || lot.startPrice || 0;
+          const match: CheckMatch = {
+            trackerId: tracker.id,
+            itemId: tracker.itemId,
+            itemName: tracker.itemName,
+            itemIcon: tracker.itemIcon,
+            region: tracker.region,
+            lotId: lot.id,
+            price,
+            upgrade: lot.upgrade,
+            quality: lot.quality,
+            qualityName: QUALITY_NAMES[lot.quality] || "Обычный",
+            endTime: lot.endTime,
+            isNew: true,
+          };
+          result.matches.push(match);
+          newCount++;
 
-      try {
-        await db
-          .update(trackers)
-          .set({
-            lastSeenLotIds: currentIds.slice(0, 300),
-            lastCheckedAt: new Date(),
-            matchCount: (tracker.matchCount || 0) + (isFirstRun ? 0 : newCount),
-            ...(newCount > 0 && !isFirstRun
-              ? { lastMatchedAt: new Date() }
-              : {}),
-          })
-          .where(eq(trackers.id, tracker.id));
-      } catch {
-        /* ignore */
+          await db.insert(notifications).values({
+            trackerId: tracker.id,
+            itemId: tracker.itemId,
+            itemName: tracker.itemName,
+            itemIcon: tracker.itemIcon,
+            region: tracker.region,
+            lotId: lot.id,
+            price,
+            upgrade: lot.upgrade,
+            quality: lot.quality,
+            qualityName: match.qualityName,
+            message: `+${lot.upgrade} • ${match.qualityName} • ${price.toLocaleString("ru-RU")} ₽`,
+            targetChatIds: targets.map((target) => target.chatId),
+            sentChatIds: [],
+            retryAt: new Date(),
+          }).onConflictDoNothing();
+        }
       }
+
+      await db.update(trackers).set({
+        lastSeenLotIds: currentIds.slice(0, 2000),
+        lastCheckedAt: new Date(),
+        lastResultCount: matching.length,
+        lastApiTotal: snapshot.total,
+        lastError: null,
+        initialReportSent: reportSent,
+        matchCount: tracker.matchCount + newCount,
+        ...(newCount ? { lastMatchedAt: new Date() } : {}),
+      }).where(eq(trackers.id, tracker.id));
     }
   }
 
-  // Чистим старые уведомления, храним последние 300
+  result.telegramSent += await deliverPending(activeChats, siteUrl);
+
   try {
-    await db.execute(
-      sql`delete from notifications where id not in (select id from notifications order by created_at desc limit 300)`
-    );
+    await db.execute(sql`delete from notifications where id not in (select id from notifications order by created_at desc limit 300)`);
   } catch {
-    /* ignore */
+    // Очистка истории не должна ломать проверку.
   }
 
-  const fresh = matches.filter(
-    (m) => m.isNew && !firstRunWithMatches.has(m.trackerId)
-  );
-  return {
-    checked: enabled.length,
-    matches: fresh,
-    totalMatches: matches.length,
-    initialized: firstRunWithMatches.size,
-    telegramSent,
-  };
+  console.log(`Tracker check [${source}]: checked=${result.checked}, apiLots=${result.apiLots}, matching=${result.totalMatches}, new=${result.matches.length}, telegram=${result.telegramSent}, failed=${result.failed}`);
+  return result;
+}
+
+export async function runTrackerCheck(source: string): Promise<CheckResult> {
+  if (activeCheck) return activeCheck;
+  activeCheck = check(source);
+  try {
+    return await activeCheck;
+  } finally {
+    activeCheck = null;
+  }
 }

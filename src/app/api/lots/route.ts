@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fetchLots, normalizeRegion } from "@/lib/exbo";
+import { ExboApiError, fetchLots, normalizeRegion } from "@/lib/exbo";
 import { QUALITY_NAMES } from "@/lib/constants";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const itemId = (searchParams.get("itemId") || "").toLowerCase().trim();
+  const itemId = (searchParams.get("itemId") || "").trim();
   const region = normalizeRegion(searchParams.get("region"));
   const limit = Math.min(500, Math.max(1, Number(searchParams.get("limit") || 200)));
   const offset = Math.max(0, Number(searchParams.get("offset") || 0));
@@ -50,9 +50,22 @@ export async function GET(req: NextRequest) {
           }
         : { min: 0, max: 0, avg: 0, count: lots.length };
 
-    return NextResponse.json({ success: true, lots, total, stats, region });
+    return NextResponse.json({
+      success: true,
+      lots,
+      total,
+      stats,
+      region,
+      source: "EXBO EAPI",
+      fetchedAt: new Date().toISOString(),
+    });
   } catch (e) {
-    console.error("GET /api/lots failed:", e);
-    return NextResponse.json({ success: false, lots: [], total: 0, error: "lots_failed" });
+    const message = e instanceof ExboApiError ? e.message : "Не удалось загрузить официальный аукцион EXBO";
+    const status = e instanceof ExboApiError ? e.status : 502;
+    console.error("GET /api/lots failed:", message);
+    return NextResponse.json(
+      { success: false, lots: [], total: 0, error: "lots_failed", message, source: "EXBO EAPI" },
+      { status },
+    );
   }
 }

@@ -38,8 +38,8 @@ export async function POST(req: NextRequest) {
         maxPrice: Math.max(0, Number(body.maxPrice) || 0),
         minPrice: Math.max(0, Number(body.minPrice) || 0),
         enabled: body.enabled ?? true,
-        enableSound: body.enableSound ?? true,
-        enableBrowser: body.enableBrowser ?? true,
+        enableSound: false,
+        enableBrowser: false,
         notifyChatIds: Array.isArray(body.notifyChatIds)
           ? body.notifyChatIds.map(String).slice(0, 20)
           : [],

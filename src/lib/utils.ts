@@ -85,30 +85,6 @@ export function debounce<T extends (...args: unknown[]) => void>(
   };
 }
 
-export function playBeep(freq = 880, duration = 180) {
-  try {
-    const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const ctx = new Ctx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.frequency.value = freq;
-    osc.type = "sine";
-    gain.gain.setValueAtTime(0.25, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration / 1000);
-    osc.start();
-    osc.stop(ctx.currentTime + duration / 1000);
-  } catch {
-    // ignore
-  }
-}
-
-export function playNotifySound() {
-  playBeep(880, 150);
-  setTimeout(() => playBeep(1174, 200), 160);
-}
-
 export const FALLBACK_ICON =
   "data:image/svg+xml;utf8," +
   encodeURIComponent(

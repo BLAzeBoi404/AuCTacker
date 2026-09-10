@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fetchHistory, normalizeRegion } from "@/lib/exbo";
+import { ExboApiError, fetchHistory, normalizeRegion } from "@/lib/exbo";
 import { QUALITY_NAMES } from "@/lib/constants";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const itemId = (searchParams.get("itemId") || "").toLowerCase().trim();
+  const itemId = (searchParams.get("itemId") || "").trim();
   const region = normalizeRegion(searchParams.get("region"));
   const limit = Math.min(1000, Math.max(1, Number(searchParams.get("limit") || 400)));
 
@@ -52,9 +52,14 @@ export async function GET(req: NextRequest) {
           }
         : { last: 0, min: 0, max: 0, avg: 0, count: history.length };
 
-    return NextResponse.json({ success: true, history, total, stats, region });
+    return NextResponse.json({ success: true, history, total, stats, region, source: "EXBO EAPI", fetchedAt: new Date().toISOString() });
   } catch (e) {
-    console.error("GET /api/history failed:", e);
-    return NextResponse.json({ success: false, history: [], total: 0, error: "history_failed" });
+    const message = e instanceof ExboApiError ? e.message : "Не удалось загрузить историю EXBO";
+    const status = e instanceof ExboApiError ? e.status : 502;
+    console.error("GET /api/history failed:", message);
+    return NextResponse.json(
+      { success: false, history: [], total: 0, error: "history_failed", message, source: "EXBO EAPI" },
+      { status },
+    );
   }
 }

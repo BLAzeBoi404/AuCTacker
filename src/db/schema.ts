@@ -43,6 +43,10 @@ export const trackers = pgTable("trackers", {
   lastCheckedAt: timestamp("last_checked_at"),
   lastMatchedAt: timestamp("last_matched_at"),
   lastSeenLotIds: jsonb("last_seen_lot_ids").$type<string[]>(),
+  lastResultCount: integer("last_result_count").notNull().default(0),
+  lastApiTotal: integer("last_api_total").notNull().default(0),
+  lastError: text("last_error"),
+  initialReportSent: boolean("initial_report_sent").notNull().default(false),
   createdAt: timestamp("created_at").defaultNow(),
 });
 
@@ -61,6 +65,12 @@ export const notifications = pgTable("notifications", {
   qualityName: text("quality_name"),
   message: text("message"),
   isRead: boolean("is_read").notNull().default(false),
+  targetChatIds: jsonb("target_chat_ids").$type<string[]>(),
+  sentChatIds: jsonb("sent_chat_ids").$type<string[]>(),
+  sentAt: timestamp("sent_at"),
+  attempts: integer("attempts").notNull().default(0),
+  retryAt: timestamp("retry_at").defaultNow(),
+  deliveryError: text("delivery_error"),
   createdAt: timestamp("created_at").defaultNow(),
 });
 

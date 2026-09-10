@@ -20,7 +20,7 @@ async function tick() {
         const r = await runTrackerCheck("scheduler");
         await pollTelegramUpdates();
         lastRun = new Date();
-        lastSummary = `проверено: ${r.checked}, новых: ${r.matches.length}, TG: ${r.telegramSent}`;
+        lastSummary = `проверено: ${r.checked}, EXBO-лотов: ${r.apiLots}, совпадений: ${r.totalMatches}, новых: ${r.matches.length}, TG: ${r.telegramSent}, ошибок: ${r.failed}`;
       } catch (e) {
         lastRun = new Date();
         lastSummary = `ошибка: ${String(e).slice(0, 120)}`;

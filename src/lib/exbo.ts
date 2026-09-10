@@ -3,17 +3,29 @@ import { items } from "@/db/schema";
 import { sql } from "drizzle-orm";
 import { DB_BASE } from "./constants";
 
-// Ключи читаются из env (прокинуты из .env). Значения по умолчанию —
-// те, что прислал пользователь, чтобы приложение работало из коробки.
-const CLIENT_ID = process.env.EXBO_CLIENT_ID || "4062";
-const CLIENT_SECRET =
-  process.env.EXBO_CLIENT_SECRET || "bcoEmyJYSCDarPliHZ0SNOkZscVDCkP0twxPwfLU";
+// Секреты читаются только из окружения Render/.env и никогда не хранятся в коде.
+const CLIENT_ID = process.env.EXBO_CLIENT_ID;
+const CLIENT_SECRET = process.env.EXBO_CLIENT_SECRET;
+
+export class ExboApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status = 502,
+  ) {
+    super(message);
+    this.name = "ExboApiError";
+  }
+}
 
 let cachedToken: string | null = null;
 let tokenExpiresAt = 0;
 
-export async function getAccessToken(force = false): Promise<string | null> {
+export async function getAccessToken(force = false): Promise<string> {
   if (!force && cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
+  if (!CLIENT_ID || !CLIENT_SECRET) {
+    throw new ExboApiError("На сервере не заданы EXBO_CLIENT_ID/EXBO_CLIENT_SECRET", 503);
+  }
+  let res: Response;
   try {
     const body = new URLSearchParams({
       grant_type: "client_credentials",
@@ -21,34 +33,30 @@ export async function getAccessToken(force = false): Promise<string | null> {
       client_secret: CLIENT_SECRET,
       scope: "",
     });
-    const res = await fetch("https://exbo.net/oauth/token", {
+    res = await fetch("https://exbo.net/oauth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
       cache: "no-store",
+      signal: AbortSignal.timeout(15000),
     });
-    if (!res.ok) {
-      console.error("EXBO token error:", res.status, await res.text());
-      return null;
-    }
-    const data = (await res.json()) as {
-      access_token?: string;
-      expires_in?: number;
-    };
-    if (!data.access_token) return null;
-    cachedToken = data.access_token;
-    tokenExpiresAt = Date.now() + (data.expires_in ? data.expires_in * 1000 - 60000 : 3600000);
-    return cachedToken;
-  } catch (e) {
-    console.error("EXBO token fetch failed:", e);
-    return null;
+  } catch {
+    throw new ExboApiError("Сервер авторизации EXBO не ответил", 504);
   }
+  if (!res.ok) {
+    throw new ExboApiError(`EXBO отклонил авторизацию (HTTP ${res.status})`, 502);
+  }
+  const data = (await res.json()) as { access_token?: string; expires_in?: number };
+  if (!data.access_token) throw new ExboApiError("EXBO не выдал токен доступа", 502);
+  cachedToken = data.access_token;
+  tokenExpiresAt = Date.now() + Math.max(30000, (data.expires_in || 3600) * 1000 - 60000);
+  return cachedToken;
 }
 
 export function normalizeRegion(r: string | null | undefined): string {
-  const v = (r || "RU").toUpperCase();
+  const v = (r || "EU").toUpperCase();
   if (v === "RU" || v === "EU" || v === "NA") return v;
-  return "RU";
+  return "EU";
 }
 
 export interface NormalizedLot {
@@ -160,33 +168,26 @@ function normalizeHistory(raw: any, idx: number): NormalizedHistory {
   return { id, price, amount, time, upgrade, quality };
 }
 
-async function eapiFetch(
-  path: string,
-  retry = true
-): Promise<{ ok: boolean; data: unknown; status: number }> {
+async function eapiFetch<T>(path: string, retry = true): Promise<T> {
   const token = await getAccessToken();
-  if (!token) return { ok: false, data: null, status: 401 };
+  let res: Response;
   try {
-    const res = await fetch(`https://eapi.stalcraft.net${path}`, {
+    res = await fetch(`https://eapi.stalcraft.net${path}`, {
       headers: { Authorization: `Bearer ${token}` },
       cache: "no-store",
+      signal: AbortSignal.timeout(15000),
     });
-    if (res.status === 401 && retry) {
-      const t2 = await getAccessToken(true);
-      if (!t2) return { ok: false, data: null, status: 401 };
-      const res2 = await fetch(`https://eapi.stalcraft.net${path}`, {
-        headers: { Authorization: `Bearer ${t2}` },
-        cache: "no-store",
-      });
-      if (!res2.ok) return { ok: false, data: null, status: res2.status };
-      return { ok: true, data: await res2.json(), status: 200 };
-    }
-    if (!res.ok) return { ok: false, data: null, status: res.status };
-    return { ok: true, data: await res.json(), status: 200 };
-  } catch (e) {
-    console.error("EAPI fetch failed:", path, e);
-    return { ok: false, data: null, status: 500 };
+  } catch {
+    throw new ExboApiError("Официальный аукцион EXBO не ответил", 504);
   }
+  if (res.status === 401 && retry) {
+    await getAccessToken(true);
+    return eapiFetch<T>(path, false);
+  }
+  if (!res.ok) {
+    throw new ExboApiError(`EXBO не вернул аукцион (HTTP ${res.status})`, res.status === 429 ? 429 : 502);
+  }
+  return (await res.json()) as T;
 }
 
 export async function fetchLots(
@@ -196,75 +197,37 @@ export async function fetchLots(
   offset = 0
 ): Promise<{ lots: NormalizedLot[]; total: number }> {
   const region = normalizeRegion(regionRaw);
-  const id = itemId.toLowerCase();
-  // EAPI отклоняет limit > 200 (HTTP 400) — держим безопасный максимум 100
-  limit = Math.min(Math.max(1, limit), 100);
-  // Пробуем несколько вариантов endpoint (регистр региона отличается в разных версиях API)
-  const paths = [
-    `/${region}/auction/${id}/lots?limit=${limit}&offset=${offset}&additional=true`,
-    `/${region.toLowerCase()}/auction/${id}/lots?limit=${limit}&offset=${offset}&additional=true`,
-  ];
-  for (const p of paths) {
-    const r = await eapiFetch(p);
-    if (r.ok) {
-      const d = r.data as {
-        lots?: unknown[];
-        items?: unknown[];
-        total?: number;
-      };
-      const arr = Array.isArray(d?.lots)
-        ? d.lots
-        : Array.isArray(d?.items)
-          ? d.items
-          : Array.isArray(d)
-            ? (d as unknown[])
-            : [];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const lots = arr.map((x, i) => normalizeLot(x as any, id, i + offset));
-      return { lots, total: Number(d?.total ?? lots.length) || lots.length };
-    }
-  }
-  return { lots: [], total: 0 };
+  const id = itemId.trim();
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new ExboApiError("Некорректный ID предмета", 400);
+  limit = Math.min(Math.max(1, Math.floor(limit)), 100);
+  offset = Math.max(0, Math.floor(offset));
+  const d = await eapiFetch<{ lots?: unknown[]; total?: number }>(
+    `/${region}/auction/${encodeURIComponent(id)}/lots?limit=${limit}&offset=${offset}&additional=true`,
+  );
+  if (!Array.isArray(d.lots)) throw new ExboApiError("EXBO изменил формат списка лотов", 502);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lots = d.lots.map((x, i) => normalizeLot(x as any, id, i + offset));
+  return { lots, total: Number(d.total ?? lots.length) || lots.length };
 }
 
 export async function fetchHistory(
   itemId: string,
   regionRaw: string,
-  limit = 200,
+  limit = 100,
   offset = 0
 ): Promise<{ history: NormalizedHistory[]; total: number }> {
   const region = normalizeRegion(regionRaw);
-  const id = itemId.toLowerCase();
-  // EAPI отклоняет большие limit (HTTP 400) — держим безопасный максимум 100
-  limit = Math.min(Math.max(1, limit), 100);
-  const paths = [
-    `/${region}/auction/${id}/history?limit=${limit}&offset=${offset}&additional=true`,
-    `/${region.toLowerCase()}/auction/${id}/history?limit=${limit}&offset=${offset}&additional=true`,
-  ];
-  for (const p of paths) {
-    const r = await eapiFetch(p);
-    if (r.ok) {
-      const d = r.data as {
-        prices?: unknown[];
-        history?: unknown[];
-        items?: unknown[];
-        total?: number;
-      };
-      const arr = Array.isArray(d?.prices)
-        ? d.prices
-        : Array.isArray(d?.history)
-          ? d.history
-          : Array.isArray(d?.items)
-            ? d.items
-            : Array.isArray(d)
-              ? (d as unknown[])
-              : [];
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const history = arr.map((x, i) => normalizeHistory(x as any, i + offset));
-      return { history, total: Number(d?.total ?? history.length) || history.length };
-    }
-  }
-  return { history: [], total: 0 };
+  const id = itemId.trim();
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new ExboApiError("Некорректный ID предмета", 400);
+  limit = Math.min(Math.max(1, Math.floor(limit)), 100);
+  offset = Math.max(0, Math.floor(offset));
+  const d = await eapiFetch<{ prices?: unknown[]; total?: number }>(
+    `/${region}/auction/${encodeURIComponent(id)}/history?limit=${limit}&offset=${offset}&additional=true`,
+  );
+  if (!Array.isArray(d.prices)) throw new ExboApiError("EXBO изменил формат истории", 502);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const history = d.prices.map((x, i) => normalizeHistory(x as any, i + offset));
+  return { history, total: Number(d.total ?? history.length) || history.length };
 }
 
 // ---------- Словарь предметов ----------

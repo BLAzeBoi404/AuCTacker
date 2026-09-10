@@ -70,6 +70,10 @@ interface Tracker {
   matchCount: number;
   lastCheckedAt: string | null;
   lastMatchedAt: string | null;
+  lastResultCount: number;
+  lastApiTotal: number;
+  lastError: string | null;
+  initialReportSent: boolean;
   createdAt: string;
 }
 interface TgChat {
@@ -129,8 +133,11 @@ async function fetchJson<T>(url: string, opts?: RequestInit, timeoutMs = 20000):
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(url, { cache: "no-store", ...opts, signal: ctrl.signal });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return (await r.json()) as T;
+    const data = await r.json().catch(() => null) as (T & { success?: boolean; message?: string }) | null;
+    if (!r.ok || data?.success === false) {
+      throw new Error(data?.message || `HTTP ${r.status}`);
+    }
+    return data as T;
   } finally {
     clearTimeout(t);
   }
@@ -139,6 +146,15 @@ async function fetchJson<T>(url: string, opts?: RequestInit, timeoutMs = 20000):
 // Цена за штуку: API отдаёт сумму за весь стак
 function perUnit(price: number, amount: number): number {
   return amount > 1 ? Math.round(price / amount) : price;
+}
+
+function trackerPriceLabel(tracker: Pick<Tracker, "minPrice" | "maxPrice">): string {
+  if (tracker.minPrice > 0 && tracker.maxPrice > 0) {
+    return `${formatPrice(tracker.minPrice)}–${formatPrice(tracker.maxPrice)} ₽`;
+  }
+  if (tracker.minPrice > 0) return `от ${formatPrice(tracker.minPrice)} ₽`;
+  if (tracker.maxPrice > 0) return `до ${formatPrice(tracker.maxPrice)} ₽`;
+  return "любая цена";
 }
 
 // Ключи localStorage (со старых staltrack_* переезжаем молча)
@@ -317,11 +333,11 @@ export default function AuctionApp() {
       setLotsTotal(d.total || (d.lots || []).length);
       setLastUpdate(new Date());
       setNextRefreshAt(Date.now() + LOTS_MS);
-    } catch {
+    } catch (error) {
       if (!silent) {
         setLots([]);
         setLotsTotal(0);
-        setApiError("Не удалось загрузить лоты. API EXBO может быть недоступно — попробуйте обновить.");
+        setApiError(error instanceof Error ? error.message : "Не удалось загрузить официальный аукцион EXBO.");
       }
     } finally {
       lotsInflight.current = false;
@@ -744,6 +760,7 @@ export default function AuctionApp() {
     try {
       const d = await fetchJson<{
         success: boolean; checked: number; totalMatches: number; initialized: number; telegramSent: number;
+        failed: number; apiLots: number; errors: string[];
         matches: { trackerId: number; itemId: string; itemName: string; itemIcon: string | null; price: number; upgrade: number; quality: number; qualityName: string; region: string }[];
       }>("/api/trackers/check", { method: "POST" });
       setLastCheck(new Date());
@@ -764,10 +781,12 @@ export default function AuctionApp() {
           fetchLots(selectedItem.id, region);
         }
       }
-      if ((d.initialized || 0) > 0) {
-        pushToast("Трекеры инициализированы", `Сейчас подходит лотов: ${d.totalMatches || 0}. Уведомления будут приходить только по новым лотам.`);
+      if (d.failed > 0) {
+        pushToast("EXBO не отдал данные", d.errors?.[0] || `Не удалось проверить трекеров: ${d.failed}.`);
+      } else if ((d.initialized || 0) > 0) {
+        pushToast("Трекеры инициализированы", `EXBO вернул ${d.apiLots} лотов, под условия подходит: ${d.totalMatches}. Отчёт отправлен в Telegram.`);
       } else if (!silent && (d.matches?.length || 0) === 0) {
-        pushToast("Проверка завершена", `Проверено трекеров: ${d.checked}, новых совпадений нет.`);
+        pushToast("Проверка завершена", `EXBO вернул ${d.apiLots} лотов; под условия подходит ${d.totalMatches}; новых — 0.`);
       }
     } catch {
       if (!silent) pushToast("Ошибка проверки", "Не удалось проверить трекеры.");
@@ -1139,6 +1158,9 @@ export default function AuctionApp() {
               {itemName(selectedItem)}
             </h1>
             <p className="mt-0.5 text-[13px] text-zinc-500">Мониторинг цен, активные лоты и история продаж.</p>
+            <p className="mt-1 flex items-center gap-1.5 text-[11px] text-zinc-600">
+              <Info className="h-3 w-3" /> Источник — официальный EXBO EAPI. Новые лоты могут появляться здесь с задержкой относительно игры.
+            </p>
 
             {/* ===== Карточка предмета ===== */}
             <div className="mt-4 flex items-center gap-4 rounded-2xl border border-zinc-800/80 bg-[#101013] p-4">
@@ -1651,13 +1673,21 @@ export default function AuctionApp() {
                             {t.targetQuality === -1 ? "любая редкость" : QUALITY_NAMES[t.targetQuality]}
                           </span>
                           <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300">
-                            {t.maxPrice > 0 ? `до ${formatPrice(t.maxPrice)} ₽` : "любая цена"}
+                            {trackerPriceLabel(t)}
                           </span>
                         </div>
                         <div className="mt-1.5 text-[11px] text-zinc-500">
-                          Совпадений: {t.matchCount}
-                          {t.lastMatchedAt ? ` · последнее ${timeAgo(t.lastMatchedAt)}` : " · пока тихо"}
+                          {t.lastCheckedAt
+                            ? `Проверено ${timeAgo(t.lastCheckedAt)} · EXBO: ${t.lastApiTotal} лотов · подходит: ${t.lastResultCount}`
+                            : "Ожидает первой проверки"}
                         </div>
+                        {t.lastError ? (
+                          <div className="mt-1 text-[11px] text-amber-400">⚠ {t.lastError}</div>
+                        ) : (
+                          <div className="mt-1 text-[11px] text-zinc-600">
+                            Новых найдено всего: {t.matchCount}{t.lastMatchedAt ? ` · последнее ${timeAgo(t.lastMatchedAt)}` : ""}
+                          </div>
+                        )}
                         <div className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
                           <Send className="h-3 w-3 shrink-0 text-sky-500" />
                           {tgChats.filter((c) => c.isActive).length === 0 ? (
@@ -1870,7 +1900,7 @@ export default function AuctionApp() {
               <section className="rounded-2xl border border-zinc-800/80 bg-[#101013] p-5">
                 <div className="flex items-center gap-2">
                   <Server className="h-4 w-4 text-[#34d399]" />
-                  <h2 className="text-[15px] font-bold text-white">Фоновый трекинг 24/7</h2>
+                  <h2 className="text-[15px] font-bold text-white">Фоновый трекинг</h2>
                   {scheduler?.enabled ? (
                     <span className="ml-auto flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300">
                       <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 live-dot" /> Работает
@@ -1898,20 +1928,20 @@ export default function AuctionApp() {
                     onChange={(e) => saveSettings({ scheduler_interval: e.target.value }, "Интервал обновлён")}
                     className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-[12.5px] text-zinc-200 outline-none"
                   >
-                    <option value="15">15 сек (только свой ПК — жрёт лимит Neon)</option>
-                    <option value="30">30 сек (только свой ПК — жрёт лимит Neon)</option>
-                    <option value="60">1 мин</option>
-                    <option value="120">2 мин</option>
-                    <option value="180">3 мин — советую для Neon Free</option>
-                    <option value="300">5 мин — советую для Neon Free</option>
-                    <option value="600">10 мин</option>
+                    <option value="15">15 сек — нужен постоянно работающий сервер</option>
+                    <option value="30">30 сек — нужен постоянно работающий сервер</option>
+                    <option value="60">1 мин — для платного хостинга/VPS</option>
+                    <option value="120">2 мин — для платного хостинга/VPS</option>
+                    <option value="300">5 мин</option>
+                    <option value="600">10 мин — тестовый Free-режим</option>
+                    <option value="900">15 мин — экономнее для Free</option>
                   </select>
                 </div>
-                {(settings?.scheduler_interval === "15" || settings?.scheduler_interval === "30") && (
+                {Number(settings?.scheduler_interval || 60) < 600 && (
                   <p className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
-                    Такой частый опрос не даёт базе Neon уснуть и съест 100 CU-hrs примерно
-                    к середине месяца. Для бесплатного Neon ставь 3–5 минут — лоты висят
-                    часами, ничего не убежит.
+                    Опрос чаще 10 минут не даёт Neon Free гарантированно уснуть. Минимальный compute
+                    при непрерывной работе расходует около 180 CU-часов за 30 дней при бесплатном лимите 100.
+                    Для проверки каждую минуту нужен платный тариф или VPS.
                   </p>
                 )}
 
@@ -1927,10 +1957,10 @@ export default function AuctionApp() {
                     <li>Нажмите <b className="text-zinc-200">Create cronjob</b>.</li>
                     <li>В поле <b className="text-zinc-200">Title</b> напишите что угодно, например auctracker.</li>
                     <li>В поле <b className="text-zinc-200">Address (URL)</b> вставьте адрес из строки ниже — целиком, вместе с secret.</li>
-                    <li>В расписании поставьте <b className="text-zinc-200">каждые 2–3 минуты</b> и сохраните.</li>
+                    <li>Для тестового Free-режима поставьте <b className="text-zinc-200">каждые 10–15 минут</b>. Для проверки каждую минуту используйте подходящий платный тариф/VPS.</li>
                   </ol>
                   <p className="mt-1.5 text-[11.5px] text-zinc-500">
-                    Как понять, что работает: строка «Последняя проверка» выше обновляется каждые пару минут, даже когда сайт закрыт.
+                    Как понять, что работает: строка «Последняя проверка» выше обновляется по расписанию, даже когда сайт закрыт.
                   </p>
                   <div className="mt-2 flex gap-2">
                     <code className="mono min-w-0 flex-1 truncate rounded-lg border border-zinc-800 bg-zinc-950 px-2.5 py-2 text-[11px] text-zinc-400">
@@ -1945,7 +1975,7 @@ export default function AuctionApp() {
                   </div>
                   <details className="mt-2 rounded-lg bg-zinc-950/60 px-3 py-2">
                     <summary className="flex items-center gap-1.5 text-[12px] font-medium text-zinc-300">
-                      <ChevronDown className="h-3.5 w-3.5" /> Бесплатный хостинг 24/7 за 10 минут
+                      <ChevronDown className="h-3.5 w-3.5" /> Настройка бесплатного тестового хостинга
                     </summary>
                     <ol className="mt-2 list-decimal space-y-1.5 pl-5 text-[12px] leading-relaxed text-zinc-400">
                       <li><b className="text-zinc-200">База.</b> Зайдите на <b className="text-zinc-200">neon.tech</b>, создайте бесплатный проект. В панели проекта скопируйте строку подключения (начинается с postgresql://) — это ваш DATABASE_URL.</li>

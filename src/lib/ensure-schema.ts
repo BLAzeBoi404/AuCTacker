@@ -65,6 +65,12 @@ export async function ensureSchema(): Promise<void> {
         quality_name text,
         message text,
         is_read boolean NOT NULL DEFAULT false,
+        target_chat_ids jsonb,
+        sent_chat_ids jsonb,
+        sent_at timestamp,
+        attempts integer NOT NULL DEFAULT 0,
+        retry_at timestamp DEFAULT now(),
+        delivery_error text,
         created_at timestamp DEFAULT now()
       );
     `);
@@ -91,10 +97,54 @@ export async function ensureSchema(): Promise<void> {
       ALTER TABLE trackers ADD COLUMN IF NOT EXISTS notify_chat_ids jsonb;
     `);
     await db.execute(sql`
+      ALTER TABLE trackers ADD COLUMN IF NOT EXISTS last_result_count integer NOT NULL DEFAULT 0;
+    `);
+    await db.execute(sql`
+      ALTER TABLE trackers ADD COLUMN IF NOT EXISTS last_api_total integer NOT NULL DEFAULT 0;
+    `);
+    await db.execute(sql`
+      ALTER TABLE trackers ADD COLUMN IF NOT EXISTS last_error text;
+    `);
+    await db.execute(sql`
+      ALTER TABLE trackers ADD COLUMN IF NOT EXISTS initial_report_sent boolean NOT NULL DEFAULT false;
+    `);
+    await db.execute(sql`
       CREATE INDEX IF NOT EXISTS items_search_idx ON items (search_text);
     `);
     await db.execute(sql`
       CREATE INDEX IF NOT EXISTS items_category_idx ON items (category);
+    `);
+    await db.execute(sql`
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS target_chat_ids jsonb;
+    `);
+    await db.execute(sql`
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sent_chat_ids jsonb;
+    `);
+    await db.execute(sql`
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sent_at timestamp;
+    `);
+    await db.execute(sql`
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+    `);
+    await db.execute(sql`
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS retry_at timestamp DEFAULT now();
+    `);
+    await db.execute(sql`
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS delivery_error text;
+    `);
+    await db.execute(sql`
+      UPDATE notifications
+      SET sent_at = COALESCE(sent_at, created_at), sent_chat_ids = COALESCE(sent_chat_ids, '[]'::jsonb)
+      WHERE target_chat_ids IS NULL AND sent_at IS NULL;
+    `);
+    await db.execute(sql`
+      DELETE FROM notifications a USING notifications b
+      WHERE a.id > b.id AND a.tracker_id = b.tracker_id AND a.lot_id = b.lot_id;
+    `);
+    await db.execute(sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS notifications_tracker_lot_uidx
+      ON notifications (tracker_id, lot_id)
+      WHERE tracker_id IS NOT NULL AND lot_id IS NOT NULL;
     `);
     await db.execute(sql`
       CREATE INDEX IF NOT EXISTS notifications_created_idx ON notifications (created_at DESC);
