@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Search, Bell, BellRing, Plus, RefreshCw, Trash2, X, ChevronLeft,
   ChevronRight, ChevronDown, Star, TrendingUp, TrendingDown, Minus,
-  Package, Gavel, History as HistoryIcon, Settings2, Volume2, VolumeX,
+  Package, Gavel, History as HistoryIcon, Settings2,
   Check, Eye, EyeOff, Zap, Shield, Crosshair, Clock, Database, Swords,
   FlaskConical, Backpack, Menu, CircleDot, ExternalLink,
   Info, Settings as SettingsIcon, Send, Copy, Link2, Server, Globe,
@@ -12,8 +12,9 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import PriceChart from "./PriceChart";
+import HomeView from "./HomeView";
 import {
-  formatPrice, getTimeLeft, formatDate, timeAgo, playNotifySound,
+  formatPrice, getTimeLeft, formatDate, timeAgo,
   FALLBACK_ICON,
 } from "@/lib/utils";
 import {
@@ -177,19 +178,14 @@ function formatCountdown(ms: number): string {
 
 export default function AuctionApp() {
   // ---------- Global state ----------
-  const [view, setView] = useState<"auction" | "catalog" | "trackers" | "settings">("auction");
-  const [region, setRegion] = useState("RU");
+  const [view, setView] = useState<"home" | "auction" | "catalog" | "trackers" | "admin">("home");
+  const [region, setRegion] = useState("EU");
   const [regionOpen, setRegionOpen] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
-  const [soundOn, setSoundOn] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
 
   // ---------- Item + search ----------
-  const [selectedItem, setSelectedItem] = useState<Item>({
-    id: "kqgy", nameRu: "Браслет",
-    iconUrl: "https://raw.githubusercontent.com/EXBO-Studio/stalzone-database/main/global/icons/artefact/kqgy.png",
-    category: "artefact",
-  });
+  const [selectedItem, setSelectedItem] = useState<Item | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<Item[]>([]);
   const [searchTotal, setSearchTotal] = useState(0);
@@ -234,7 +230,7 @@ export default function AuctionApp() {
   const [showTrackerModal, setShowTrackerModal] = useState(false);
   const [trackerForm, setTrackerForm] = useState({
     upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1,
-    maxPrice: 0, minPrice: 0, enableSound: true, enableBrowser: true,
+    maxPrice: 0, minPrice: 0,
   });
   const [checkInterval, setCheckInterval] = useState(30);
   const [checking, setChecking] = useState(false);
@@ -244,9 +240,6 @@ export default function AuctionApp() {
   const [notifications, setNotifications] = useState<Notif[]>([]);
   const [unread, setUnread] = useState(0);
   const [showNotifs, setShowNotifs] = useState(false);
-  const [notifPermission, setNotifPermission] = useState<string>(
-    typeof Notification !== "undefined" ? Notification.permission : "unsupported"
-  );
 
   // ---------- Toasts ----------
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -268,8 +261,6 @@ export default function AuctionApp() {
     try {
       const r = lsGet("region");
       if (r) setRegion(r);
-      const s = lsGet("sound");
-      if (s !== null) setSoundOn(s === "1");
       const it = lsGet("item");
       const params = new URLSearchParams(window.location.search);
       const urlItem = params.get("item");
@@ -578,7 +569,7 @@ export default function AuctionApp() {
   }, [pushToast, catalogQuery, catalogCategory]);
 
   useEffect(() => {
-    if (view === "settings") loadSettings();
+    if (view === "admin") loadSettings();
   }, [view, loadSettings]);
 
   useEffect(() => {
@@ -597,11 +588,21 @@ export default function AuctionApp() {
 
   const loadCatalog = useCallback(async (q: string, cat: string, pg: number) => {
     setCatalogLoading(true);
-    try {
+    // Долгий холодный старт Neon — даём запас; при пустом ответе на первой попытке повторяем.
+    const fetchOnce = async () => {
       const off = (pg - 1) * catalogPerPage;
-      const d = await fetchJson<{ success: boolean; items: Item[]; total: number; needsSync?: boolean; categories: { category: string; count: number }[] }>(
-        `/api/items?q=${encodeURIComponent(q)}&category=${encodeURIComponent(cat)}&limit=${catalogPerPage}&offset=${off}`
+      return fetchJson<{ success: boolean; items: Item[]; total: number; needsSync?: boolean; categories: { category: string; count: number }[] }>(
+        `/api/items?q=${encodeURIComponent(q)}&category=${encodeURIComponent(cat)}&limit=${catalogPerPage}&offset=${off}`,
+        undefined,
+        45000
       );
+    };
+    try {
+      let d = await fetchOnce();
+      // Если предметы почему-то пришли пустыми, а всего их много — повтор один раз
+      if ((!d.items || d.items.length === 0) && (d.total || 0) > 0 && !q) {
+        d = await fetchOnce();
+      }
       setCatalogItems(d.items || []);
       setCatalogTotal(d.total || 0);
       setCatalogNeedsSync(!!d.needsSync && (d.total || 0) === 0);
@@ -756,15 +757,7 @@ export default function AuctionApp() {
             `+${m.upgrade} • ${m.qualityName} • ${formatPrice(m.price)} ₽ (${m.region})`,
             m.itemIcon
           );
-          if (soundOn && (tr?.enableSound ?? true)) playNotifySound();
-          if ((tr?.enableBrowser ?? true) && typeof Notification !== "undefined" && Notification.permission === "granted") {
-            try {
-              new Notification(`🎯 ${m.itemName}`, {
-                body: `+${m.upgrade} • ${m.qualityName} • ${formatPrice(m.price)} ₽`,
-                icon: m.itemIcon || undefined,
-              });
-            } catch { /* ignore */ }
-          }
+          // Уведомления только в Telegram — браузерные пуши и звук отключены
         }
         // если совпавший предмет открыт — обновить лоты
         if (selectedItem && d.matches.some((m) => m.itemId === selectedItem.id && m.region === region)) {
@@ -782,7 +775,7 @@ export default function AuctionApp() {
       setChecking(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [checking, trackers, soundOn, selectedItem?.id, region]);
+  }, [checking, trackers, selectedItem?.id, region]);
 
   useEffect(() => {
     if (trackers.filter((t) => t.enabled).length === 0) return;
@@ -790,17 +783,6 @@ export default function AuctionApp() {
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [checkInterval, trackers.length]);
-
-  const requestNotifPermission = async () => {
-    if (typeof Notification === "undefined") {
-      pushToast("Не поддерживается", "Ваш браузер не поддерживает уведомления.");
-      return;
-    }
-    const p = await Notification.requestPermission();
-    setNotifPermission(p);
-    if (p === "granted") pushToast("Уведомления включены", "Теперь вы будете получать пуши о найденных лотах.");
-    else pushToast("Уведомления отклонены", "Разрешите уведомления в настройках браузера.");
-  };
 
   // ---------- Tracker CRUD ----------
   const saveTracker = async () => {
@@ -821,7 +803,7 @@ export default function AuctionApp() {
       setShowTrackerModal(false);
       loadTrackers();
       pushToast("Трекер создан", `${itemName(selectedItem)} — слежка запущена.`);
-      setTrackerForm({ upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1, maxPrice: 0, minPrice: 0, enableSound: true, enableBrowser: true });
+      setTrackerForm({ upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1, maxPrice: 0, minPrice: 0 });
       setTgSelected(null);
     } catch {
       pushToast("Ошибка", "Не удалось создать трекер.");
@@ -937,15 +919,15 @@ export default function AuctionApp() {
     <div className="min-h-screen bg-[#060607]">
       {/* ===== Фоновые свечения ===== */}
       <div aria-hidden className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute -top-48 left-1/2 h-[420px] w-[920px] -translate-x-1/2 rounded-full bg-[#d4ff3f]/[0.05] blur-[130px]" />
+        <div className="absolute -top-48 left-1/2 h-[420px] w-[920px] -translate-x-1/2 rounded-full bg-[#34d399]/[0.05] blur-[130px]" />
         <div className="absolute -left-48 top-1/3 h-96 w-96 rounded-full bg-violet-600/[0.07] blur-[110px]" />
         <div className="absolute -right-48 top-2/3 h-96 w-96 rounded-full bg-sky-500/[0.06] blur-[110px]" />
       </div>
       {/* ===== Navbar ===== */}
       <header className="sticky top-0 z-50 border-b border-zinc-800/80 bg-[#0a0a0c]/90 shadow-[0_8px_30px_rgba(0,0,0,0.45)] backdrop-blur-xl">
         <div className="mx-auto flex h-14 max-w-[1280px] items-center gap-2 px-4">
-          <button onClick={() => setView("auction")} className="group flex items-center gap-2">
-            <span className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-[#e4ff70] to-[#a3cc00] text-black shadow-[0_0_18px_rgba(212,255,63,0.35)] transition group-hover:shadow-[0_0_26px_rgba(212,255,63,0.55)]">
+          <button onClick={() => setView("home")} className="group flex items-center gap-2">
+            <span className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-[#34d399] to-[#059669] text-black shadow-[0_0_18px_rgba(52,211,153,0.35)] transition group-hover:shadow-[0_0_26px_rgba(52,211,153,0.55)]">
               <Star className="h-4 w-4" fill="currentColor" />
             </span>
             <span className="text-[15px] font-extrabold tracking-wide text-white">AucTracker</span>
@@ -961,11 +943,11 @@ export default function AuctionApp() {
             <button onClick={() => setView("trackers")} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition ${view === "trackers" ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"}`}>
               <Crosshair className="h-3.5 w-3.5 shrink-0" />Трекеры
               {trackers.length > 0 && (
-                <span className="rounded-full bg-[#d4ff3f] px-1.5 py-0.5 text-[10px] font-bold leading-none text-black">{trackers.length}</span>
+                <span className="rounded-full bg-[#34d399] px-1.5 py-0.5 text-[10px] font-bold leading-none text-black">{trackers.length}</span>
               )}
             </button>
-            <button onClick={() => setView("settings")} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition ${view === "settings" ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"}`}>
-              <SettingsIcon className="h-3.5 w-3.5 shrink-0" />Настройки
+            <button onClick={() => setView("admin")} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition ${view === "admin" ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"}`}>
+              <SettingsIcon className="h-3.5 w-3.5 shrink-0" />Админ
             </button>
           </nav>
 
@@ -990,7 +972,7 @@ export default function AuctionApp() {
                         lsSet("region", r.id);
                         setRegionOpen(false);
                       }}
-                      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] hover:bg-zinc-800 ${region === r.id ? "text-[#d4ff3f]" : "text-zinc-300"}`}
+                      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] hover:bg-zinc-800 ${region === r.id ? "text-[#34d399]" : "text-zinc-300"}`}
                     >
                       <span>{r.flag}</span> {r.label}
                       {region === r.id && <Check className="ml-auto h-3.5 w-3.5" />}
@@ -999,14 +981,6 @@ export default function AuctionApp() {
                 </div>
               )}
             </div>
-
-            <button
-              onClick={() => { setSoundOn((v) => { lsSet("sound", !v ? "1" : "0"); return !v; }); }}
-              title={soundOn ? "Выключить звук" : "Включить звук"}
-              className="hidden rounded-lg border border-zinc-800 bg-zinc-900/60 p-2 text-zinc-400 hover:text-white sm:block"
-            >
-              {soundOn ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
-            </button>
 
             <button
               onClick={() => { setShowNotifs(true); }}
@@ -1035,7 +1009,7 @@ export default function AuctionApp() {
               { v: "auction", t: "Аукцион" },
               { v: "catalog", t: "Предметы" },
               { v: "trackers", t: `Трекеры (${trackers.length})` },
-              { v: "settings", t: "Настройки" },
+              { v: "admin", t: "Админ" },
             ] as const).map((item) => (
               <button
                 key={item.v}
@@ -1050,7 +1024,8 @@ export default function AuctionApp() {
       </header>
 
       <main className="relative mx-auto max-w-[1280px] px-4 pb-24 pt-5">
-        {/* ===== Поиск ===== */}
+        {/* ===== Поиск (скрыт на главной) ===== */}
+        {view !== "home" && (
         <div ref={searchRef} className="relative z-30 mx-auto max-w-3xl">
           <div className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500">
             <Search className="h-4 w-4" />
@@ -1061,10 +1036,10 @@ export default function AuctionApp() {
             onFocus={() => { setShowDropdown(true); if (searchResults.length === 0) doSearch(searchQuery); }}
             onKeyDown={onSearchKey}
             placeholder="Быстрый поиск предмета… (название, ID или категория)"
-            className="w-full rounded-xl border border-zinc-800 bg-[#121214] py-3 pl-11 pr-12 text-[14px] text-white placeholder-zinc-500 outline-none transition focus:border-[#d4ff3f]/60 focus:ring-2 focus:ring-[#d4ff3f]/10"
+            className="w-full rounded-xl border border-zinc-800 bg-[#121214] py-3 pl-11 pr-12 text-[14px] text-white placeholder-zinc-500 outline-none transition focus:border-[#34d399]/60 focus:ring-2 focus:ring-[#34d399]/10"
           />
           {searchLoading && (
-            <div className="absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin rounded-full border-2 border-zinc-700 border-t-[#d4ff3f]" />
+            <div className="absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin rounded-full border-2 border-zinc-700 border-t-[#34d399]" />
           )}
           {showDropdown && searchResults.length > 0 && (
             <ul className="absolute left-0 right-0 top-full z-50 mt-2 max-h-[340px] overflow-y-auto rounded-xl border border-zinc-800 bg-[#121214] shadow-2xl anim-fade-up">
@@ -1098,8 +1073,40 @@ export default function AuctionApp() {
             </ul>
           )}
         </div>
+        )}
 
-        {view === "auction" && (
+        {view === "home" && (
+          <HomeView onNavigate={setView as (v: "auction" | "catalog") => void} />
+        )}
+
+        {view === "auction" && !selectedItem && (
+          <div className="anim-fade-up">
+            <div className="mt-10 flex flex-col items-center rounded-3xl border border-zinc-800/80 bg-[#101013] px-6 py-16 text-center">
+              <span className="grid h-14 w-14 place-items-center rounded-2xl bg-[#34d399]/15 text-[#34d399]">
+                <Search className="h-6 w-6" />
+              </span>
+              <h1 className="mt-4 text-xl font-bold text-white">Найдите предмет на аукционе</h1>
+              <p className="mt-2 max-w-md text-[13.5px] leading-relaxed text-zinc-400">
+                Введите название, ID или категорию в строку поиска выше — и мы покажем
+                активные лоты, цены и историю продаж. Или загляните в{" "}
+                <button onClick={() => setView("catalog")} className="font-semibold text-[#34d399] underline-offset-2 hover:underline">
+                  каталог предметов
+                </button>
+                .
+              </p>
+              <div className="mt-6 flex flex-wrap justify-center gap-2">
+                <button
+                  onClick={() => setView("catalog")}
+                  className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2.5 text-[13px] font-bold text-black hover:brightness-110"
+                >
+                  <Package className="h-4 w-4" /> Все предметы
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {view === "auction" && selectedItem && (
           <div className="anim-fade-up">
             {/* ===== Хлебные крошки ===== */}
             <div className="mt-5 flex flex-wrap items-center gap-1.5 text-[12.5px] text-zinc-500">
@@ -1157,7 +1164,7 @@ export default function AuctionApp() {
                 </span>
                 <button
                   onClick={() => setShowTrackerModal(true)}
-                  className="flex items-center gap-1.5 rounded-xl bg-[#d4ff3f] px-4 py-2 text-[13px] font-bold text-black transition hover:brightness-110"
+                  className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2 text-[13px] font-bold text-black transition hover:brightness-110"
                 >
                   <Crosshair className="h-4 w-4" /> Следить
                 </button>
@@ -1165,7 +1172,7 @@ export default function AuctionApp() {
             </div>
             <button
               onClick={() => setShowTrackerModal(true)}
-              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl bg-[#d4ff3f] px-4 py-2.5 text-[13px] font-bold text-black sm:hidden"
+              className="mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2.5 text-[13px] font-bold text-black sm:hidden"
             >
               <Crosshair className="h-4 w-4" /> Следить за предметом
             </button>
@@ -1260,7 +1267,7 @@ export default function AuctionApp() {
               <label className="ml-auto flex cursor-pointer items-center gap-2 text-[12px] text-zinc-500">
                 <button
                   onClick={() => setAutoRefresh((v) => !v)}
-                  className={`relative h-5 w-9 rounded-full transition ${autoRefresh ? "bg-[#d4ff3f]" : "bg-zinc-700"}`}
+                  className={`relative h-5 w-9 rounded-full transition ${autoRefresh ? "bg-[#34d399]" : "bg-zinc-700"}`}
                 >
                   <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${autoRefresh ? "left-[18px]" : "left-0.5"}`} />
                 </button>
@@ -1425,19 +1432,6 @@ export default function AuctionApp() {
               )}
             </div>
 
-            {/* Подсказка про уведомления */}
-            {notifPermission !== "granted" && (
-              <div className="mt-4 flex flex-wrap items-center gap-3 rounded-2xl border border-[#d4ff3f]/20 bg-[#d4ff3f]/5 p-4">
-                <BellRing className="h-5 w-5 shrink-0 text-[#d4ff3f]" />
-                <div className="min-w-0 flex-1">
-                  <p className="text-[13.5px] font-semibold text-white">Включите браузерные уведомления</p>
-                  <p className="text-[12px] text-zinc-400">Чтобы получать пуши о лотах, даже когда вкладка неактивна.</p>
-                </div>
-                <button onClick={requestNotifPermission} className="rounded-xl bg-[#d4ff3f] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110">
-                  Включить
-                </button>
-              </div>
-            )}
           </div>
         )}
 
@@ -1486,7 +1480,7 @@ export default function AuctionApp() {
                     className="w-full rounded-xl border border-zinc-800 bg-[#121214] py-2.5 pl-10 pr-10 text-[13px] text-white outline-none placeholder-zinc-600 focus:border-zinc-600"
                   />
                   {catalogLoading ? (
-                    <div className="absolute right-3.5 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin rounded-full border-2 border-zinc-700 border-t-[#d4ff3f]" />
+                    <div className="absolute right-3.5 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin rounded-full border-2 border-zinc-700 border-t-[#34d399]" />
                   ) : catalogQuery ? (
                     <button
                       onClick={() => onCatalogQuery("")}
@@ -1504,8 +1498,8 @@ export default function AuctionApp() {
                   </div>
                 ) : catalogItems.length === 0 ? (
                   catalogNeedsSync && !catalogQuery ? (
-                    <div className="mt-3 rounded-2xl border border-[#d4ff3f]/25 bg-[#101013] p-10 text-center anim-fade-up">
-                      <Database className="mx-auto h-8 w-8 text-[#d4ff3f]" />
+                    <div className="mt-3 rounded-2xl border border-[#34d399]/25 bg-[#101013] p-10 text-center anim-fade-up">
+                      <Database className="mx-auto h-8 w-8 text-[#34d399]" />
                       <p className="mt-3 text-[15px] font-semibold text-white">База предметов ещё пустая</p>
                       <p className="mx-auto mt-1 max-w-md text-[13px] leading-relaxed text-zinc-500">
                         На свежей базе каталог подтягивается с GitHub один раз — это до пары минут.
@@ -1514,7 +1508,7 @@ export default function AuctionApp() {
                       <button
                         onClick={syncItems}
                         disabled={catalogSyncing}
-                        className="mt-4 rounded-xl bg-[#d4ff3f] px-5 py-2.5 text-[13px] font-bold text-black hover:brightness-110 disabled:opacity-50"
+                        className="mt-4 rounded-xl bg-[#34d399] px-5 py-2.5 text-[13px] font-bold text-black hover:brightness-110 disabled:opacity-50"
                       >
                         {catalogSyncing ? "Загружаю… подождите" : "Загрузить базу предметов"}
                       </button>
@@ -1531,7 +1525,7 @@ export default function AuctionApp() {
                         <button
                           key={it.id}
                           onClick={() => selectItem(it)}
-                          className="group flex items-center gap-2.5 rounded-xl border border-zinc-800/80 bg-[#101013] p-2.5 text-left transition hover:border-[#d4ff3f]/40 hover:bg-zinc-900"
+                          className="group flex items-center gap-2.5 rounded-xl border border-zinc-800/80 bg-[#101013] p-2.5 text-left transition hover:border-[#34d399]/40 hover:bg-zinc-900"
                         >
                           {/* eslint-disable-next-line @next/next/no-img-element */}
                           <img
@@ -1606,24 +1600,12 @@ export default function AuctionApp() {
                 </button>
                 <button
                   onClick={() => setShowTrackerModal(true)}
-                  className="flex items-center gap-1.5 rounded-xl bg-[#d4ff3f] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110"
+                  className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110"
                 >
                   <Plus className="h-4 w-4" /> Новый трекер
                 </button>
               </div>
             </div>
-
-            {notifPermission !== "granted" && (
-              <div className="mt-4 flex flex-wrap items-center gap-3 rounded-2xl border border-[#d4ff3f]/20 bg-[#d4ff3f]/5 p-4">
-                <BellRing className="h-5 w-5 text-[#d4ff3f]" />
-                <p className="min-w-0 flex-1 text-[13px] text-zinc-300">
-                  Разрешите уведомления в браузере, чтобы не пропустить нужный лот.
-                </p>
-                <button onClick={requestNotifPermission} className="rounded-xl bg-[#d4ff3f] px-4 py-2 text-[13px] font-bold text-black">
-                  Разрешить
-                </button>
-              </div>
-            )}
 
             {trackers.length === 0 ? (
               <div className="mt-4 rounded-2xl border border-dashed border-zinc-800 bg-[#101013] p-12 text-center">
@@ -1633,7 +1615,7 @@ export default function AuctionApp() {
                   Откройте любой предмет на аукционе и нажмите «Следить» — мы будем проверять лоты каждые {checkInterval} сек
                   и присылать уведомление, когда появится заточка, редкость и цена под ваши условия.
                 </p>
-                <button onClick={() => setView("catalog")} className="mt-4 rounded-xl bg-[#d4ff3f] px-5 py-2.5 text-[13px] font-bold text-black">
+                <button onClick={() => setView("catalog")} className="mt-4 rounded-xl bg-[#34d399] px-5 py-2.5 text-[13px] font-bold text-black">
                   Выбрать предмет
                 </button>
               </div>
@@ -1656,7 +1638,7 @@ export default function AuctionApp() {
                               .then((d) => { if (d.success) selectItem(d.item); })
                               .catch(() => selectItem({ id: t.itemId, nameRu: t.itemName, iconUrl: t.itemIcon || undefined }));
                           }}
-                          className="flex items-center gap-1 truncate text-[14px] font-semibold text-white hover:text-[#d4ff3f]"
+                          className="flex items-center gap-1 truncate text-[14px] font-semibold text-white hover:text-[#34d399]"
                         >
                           {t.itemName} <ExternalLink className="h-3 w-3 shrink-0" />
                         </button>
@@ -1695,11 +1677,8 @@ export default function AuctionApp() {
                       >
                         {t.enabled ? <><Eye className="h-3.5 w-3.5" /> Активен</> : <><EyeOff className="h-3.5 w-3.5" /> Пауза</>}
                       </button>
-                      <span className="flex items-center gap-1 text-[11px] text-zinc-500" title="Звук">
-                        <Volume2 className={`h-3.5 w-3.5 ${t.enableSound ? "text-[#d4ff3f]" : "text-zinc-700"}`} />
-                      </span>
-                      <span className="flex items-center gap-1 text-[11px] text-zinc-500" title="Браузерный пуш">
-                        <Bell className={`h-3.5 w-3.5 ${t.enableBrowser ? "text-[#d4ff3f]" : "text-zinc-700"}`} />
+                      <span className="flex items-center gap-1 text-[11px] text-zinc-500" title="Telegram">
+                        <Send className="h-3.5 w-3.5 text-sky-400" />
                       </span>
                       <button
                         onClick={() => deleteTracker(t.id)}
@@ -1714,10 +1693,10 @@ export default function AuctionApp() {
             )}
           </div>
         )}
-        {view === "settings" && (
+        {view === "admin" && (
           <div className="mt-5 anim-fade-up">
             <h1 className="flex items-center gap-2 text-xl font-bold text-white">
-              <SettingsIcon className="h-5 w-5 text-[#d4ff3f]" /> Настройки
+              <SettingsIcon className="h-5 w-5 text-[#34d399]" /> Админ-панель
             </h1>
             <p className="mt-0.5 text-[13px] text-zinc-500">
               Telegram-уведомления, фоновый трекинг 24/7 и адрес сайта.
@@ -1756,7 +1735,7 @@ export default function AuctionApp() {
                       <button
                         onClick={saveTgToken}
                         disabled={tgBusy || !tgTokenInput.trim()}
-                        className="shrink-0 rounded-xl bg-[#d4ff3f] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110 disabled:opacity-50"
+                        className="shrink-0 rounded-xl bg-[#34d399] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110 disabled:opacity-50"
                       >
                         {tgBusy ? "…" : "Подключить"}
                       </button>
@@ -1814,7 +1793,7 @@ export default function AuctionApp() {
                         <button
                           onClick={genLinkCode}
                           disabled={tgBusy}
-                          className="flex items-center gap-1.5 rounded-xl bg-[#d4ff3f] px-4 py-2 text-[12.5px] font-bold text-black hover:brightness-110 disabled:opacity-50"
+                          className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2 text-[12.5px] font-bold text-black hover:brightness-110 disabled:opacity-50"
                         >
                           <KeyRound className="h-3.5 w-3.5" /> {tgBusy ? "…" : "Получить код"}
                         </button>
@@ -1827,8 +1806,8 @@ export default function AuctionApp() {
                         </button>
                       </div>
                       {linkCode && (
-                        <div className="mt-2.5 flex flex-wrap items-center gap-2 rounded-xl border border-[#d4ff3f]/25 bg-[#d4ff3f]/5 p-3 anim-fade-up">
-                          <span className="mono text-xl font-extrabold tracking-[0.2em] text-[#d4ff3f]">{linkCode}</span>
+                        <div className="mt-2.5 flex flex-wrap items-center gap-2 rounded-xl border border-[#34d399]/25 bg-[#34d399]/5 p-3 anim-fade-up">
+                          <span className="mono text-xl font-extrabold tracking-[0.2em] text-[#34d399]">{linkCode}</span>
                           <button onClick={() => copyText(linkCode, "Код скопирован")} className="rounded-lg border border-zinc-700 bg-zinc-800 p-1.5 text-zinc-300 hover:text-white" title="Скопировать код">
                             <Copy className="h-3.5 w-3.5" />
                           </button>
@@ -1890,7 +1869,7 @@ export default function AuctionApp() {
               {/* ===== Фоновый трекинг ===== */}
               <section className="rounded-2xl border border-zinc-800/80 bg-[#101013] p-5">
                 <div className="flex items-center gap-2">
-                  <Server className="h-4 w-4 text-[#d4ff3f]" />
+                  <Server className="h-4 w-4 text-[#34d399]" />
                   <h2 className="text-[15px] font-bold text-white">Фоновый трекинг 24/7</h2>
                   {scheduler?.enabled ? (
                     <span className="ml-auto flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300">
@@ -1908,7 +1887,7 @@ export default function AuctionApp() {
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <button
                     onClick={() => saveSettings({ scheduler_enabled: scheduler?.enabled ? "0" : "1" }, "Фоновый трекинг обновлён")}
-                    className={`relative h-6 w-11 shrink-0 rounded-full transition ${scheduler?.enabled ? "bg-[#d4ff3f]" : "bg-zinc-700"}`}
+                    className={`relative h-6 w-11 shrink-0 rounded-full transition ${scheduler?.enabled ? "bg-[#34d399]" : "bg-zinc-700"}`}
                     title="Вкл/выкл планировщик"
                   >
                     <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${scheduler?.enabled ? "left-[22px]" : "left-0.5"}`} />
@@ -2002,7 +1981,7 @@ export default function AuctionApp() {
                   </button>
                   <button
                     onClick={() => saveSettings({ site_url: siteUrlInput }, "Адрес сайта сохранён")}
-                    className="shrink-0 rounded-xl bg-[#d4ff3f] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110"
+                    className="shrink-0 rounded-xl bg-[#34d399] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110"
                   >
                     Сохранить
                   </button>
@@ -2022,15 +2001,15 @@ export default function AuctionApp() {
               </section>
 
               {/* ===== Как это работает ===== */}
-              <section className="rounded-2xl border border-[#d4ff3f]/20 bg-[#d4ff3f]/[0.03] p-5">
+              <section className="rounded-2xl border border-[#34d399]/20 bg-[#34d399]/[0.03] p-5">
                 <div className="flex items-center gap-2">
-                  <Zap className="h-4 w-4 text-[#d4ff3f]" />
+                  <Zap className="h-4 w-4 text-[#34d399]" />
                   <h2 className="text-[15px] font-bold text-white">Как работает пассивный трекинг</h2>
                 </div>
                 <ol className="mt-2 space-y-2 text-[12.5px] leading-relaxed text-zinc-400">
-                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">1.</span> Сервер сам смотрит аукцион каждые N секунд и присылает в Telegram только новые лоты. Сайт держать открытым не надо.</li>
-                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">2.</span> Если сайт на бесплатном хостинге — cron-пинг его будит, проверки не останавливаются.</li>
-                  <li className="flex gap-2"><span className="mono font-bold text-[#d4ff3f]">3.</span> Открытая вкладка проверяет чаще (каждые 30 секунд) и добавляет звук + всплывающие уведомления.</li>
+                  <li className="flex gap-2"><span className="mono font-bold text-[#34d399]">1.</span> Сервер сам смотрит аукцион каждые N секунд и присылает в Telegram только новые лоты. Сайт держать открытым не надо.</li>
+                  <li className="flex gap-2"><span className="mono font-bold text-[#34d399]">2.</span> Если сайт на бесплатном хостинге — cron-пинг его будит, проверки не останавливаются.</li>
+                  <li className="flex gap-2"><span className="mono font-bold text-[#34d399]">3.</span> Открытая вкладка проверяет чаще (каждые 30 секунд) и добавляет звук + всплывающие уведомления.</li>
                 </ol>
                 <p className="mt-2 rounded-xl bg-zinc-900/60 px-3 py-2 text-[11.5px] leading-relaxed text-zinc-500">
                   Один и тот же лот дважды не придёт: сайт запоминает, что уже показывал. Первый запуск трекера молчаливый — он просто запоминает текущие лоты, а следить начинает со следующего обновления.
@@ -2048,7 +2027,7 @@ export default function AuctionApp() {
             <span className="mono flex items-center gap-2 text-[13px] font-semibold text-zinc-300">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 live-dot" />
               Обновление аукциона через
-              <span className="text-[#d4ff3f]">
+              <span className="text-[#34d399]">
                 {formatCountdown(nextRefreshAt - nowMs)}
               </span>
               {lotsRefreshing && <span className="text-[11px] font-normal text-zinc-500">· загружаю…</span>}
@@ -2103,7 +2082,7 @@ export default function AuctionApp() {
                     <button
                       key={o.v}
                       onClick={() => setTrackerForm((f) => ({ ...f, upgradeMode: o.v }))}
-                      className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${trackerForm.upgradeMode === o.v ? "bg-[#d4ff3f] text-black" : "text-zinc-400 hover:text-white"}`}
+                      className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${trackerForm.upgradeMode === o.v ? "bg-[#34d399] text-black" : "text-zinc-400 hover:text-white"}`}
                     >
                       {o.t}
                     </button>
@@ -2158,28 +2137,13 @@ export default function AuctionApp() {
                 </div>
               </div>
 
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setTrackerForm((f) => ({ ...f, enableSound: !f.enableSound }))}
-                  className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-[12.5px] font-medium ${trackerForm.enableSound ? "border-[#d4ff3f]/40 bg-[#d4ff3f]/10 text-[#d4ff3f]" : "border-zinc-800 text-zinc-500"}`}
-                >
-                  <Volume2 className="h-3.5 w-3.5" /> Звук
-                </button>
-                <button
-                  onClick={() => setTrackerForm((f) => ({ ...f, enableBrowser: !f.enableBrowser }))}
-                  className={`flex flex-1 items-center justify-center gap-1.5 rounded-xl border px-3 py-2 text-[12.5px] font-medium ${trackerForm.enableBrowser ? "border-[#d4ff3f]/40 bg-[#d4ff3f]/10 text-[#d4ff3f]" : "border-zinc-800 text-zinc-500"}`}
-                >
-                  <Bell className="h-3.5 w-3.5" /> Пуш
-                </button>
-              </div>
-
               <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
                 <div className="mb-2 flex items-center gap-1.5 text-[12.5px] font-semibold text-zinc-200">
                   <Send className="h-3.5 w-3.5 text-sky-400" /> Уведомления в Telegram
                 </div>
                 {tgChats.filter((c) => c.isActive).length === 0 ? (
                   <button
-                    onClick={() => { setShowTrackerModal(false); setView("settings"); }}
+                    onClick={() => { setShowTrackerModal(false); setView("admin"); }}
                     className="w-full rounded-lg border border-dashed border-zinc-700 px-3 py-2 text-[12px] leading-relaxed text-zinc-400 hover:border-sky-500/50 hover:text-sky-300"
                   >
                     Привяжите Telegram в настройках — уведомления будут приходить, даже когда сайт закрыт →
@@ -2191,7 +2155,7 @@ export default function AuctionApp() {
                         type="checkbox"
                         checked={tgSelected === null}
                         onChange={() => setTgSelected(tgSelected === null ? tgChats.filter((c) => c.isActive).map((c) => c.chatId) : null)}
-                        className="h-3.5 w-3.5 accent-[#d4ff3f]"
+                        className="h-3.5 w-3.5 accent-[#34d399]"
                       />
                       Всем привязанным ({tgChats.filter((c) => c.isActive).length})
                     </label>
@@ -2204,7 +2168,7 @@ export default function AuctionApp() {
                             const arr = prev || [];
                             return arr.includes(c.chatId) ? arr.filter((x) => x !== c.chatId) : [...arr, c.chatId];
                           })}
-                          className="h-3.5 w-3.5 accent-[#d4ff3f]"
+                          className="h-3.5 w-3.5 accent-[#34d399]"
                         />
                         <span className="truncate">{c.name || c.chatId} {c.username ? <span className="text-zinc-500">@{c.username}</span> : null}</span>
                       </label>
@@ -2219,7 +2183,7 @@ export default function AuctionApp() {
             </div>
 
             <div className="mt-4 flex gap-2">
-              <button onClick={saveTracker} className="flex-1 rounded-xl bg-[#d4ff3f] py-2.5 text-[13.5px] font-bold text-black hover:brightness-110">
+              <button onClick={saveTracker} className="flex-1 rounded-xl bg-[#34d399] py-2.5 text-[13.5px] font-bold text-black hover:brightness-110">
                 Запустить слежку
               </button>
               <button onClick={() => setShowTrackerModal(false)} className="rounded-xl bg-zinc-800 px-5 py-2.5 text-[13.5px] font-medium text-zinc-300 hover:bg-zinc-700">
@@ -2238,7 +2202,7 @@ export default function AuctionApp() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-2 border-b border-zinc-800 p-4">
-              <Bell className="h-4 w-4 text-[#d4ff3f]" />
+              <Bell className="h-4 w-4 text-[#34d399]" />
               <h2 className="text-[15px] font-bold text-white">Уведомления</h2>
               {unread > 0 && <span className="rounded-full bg-red-500 px-2 py-0.5 text-[11px] font-bold text-white">{unread} новых</span>}
               <div className="ml-auto flex gap-1.5">
@@ -2265,19 +2229,19 @@ export default function AuctionApp() {
               ) : (
                 <div className="space-y-2">
                   {notifications.map((n) => (
-                    <div key={n.id} className={`flex gap-3 rounded-xl border p-3 ${n.isRead ? "border-zinc-800/60 bg-zinc-900/30" : "border-[#d4ff3f]/25 bg-[#d4ff3f]/5"}`}>
+                    <div key={n.id} className={`flex gap-3 rounded-xl border p-3 ${n.isRead ? "border-zinc-800/60 bg-zinc-900/30" : "border-[#34d399]/25 bg-[#34d399]/5"}`}>
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img src={n.itemIcon || FALLBACK_ICON} alt="" onError={(e) => { (e.target as HTMLImageElement).src = FALLBACK_ICON; }} className="h-10 w-10 shrink-0 rounded-lg border border-zinc-800 bg-zinc-900 object-contain p-1" />
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-[13px] font-semibold text-white">{n.itemName}</p>
-                        <p className="mono mt-0.5 text-[12.5px] font-bold text-[#d4ff3f]">
+                        <p className="mono mt-0.5 text-[12.5px] font-bold text-[#34d399]">
                           +{n.upgrade} · {formatPrice(n.price)} ₽
                         </p>
                         <p className="mt-0.5 text-[11px] text-zinc-500">
                           {n.qualityName} · {n.region} · {timeAgo(n.createdAt)}
                         </p>
                       </div>
-                      {!n.isRead && <span className="h-2 w-2 shrink-0 rounded-full bg-[#d4ff3f]" />}
+                      {!n.isRead && <span className="h-2 w-2 shrink-0 rounded-full bg-[#34d399]" />}
                     </div>
                   ))}
                 </div>
@@ -2300,12 +2264,12 @@ export default function AuctionApp() {
       {/* ===== Тосты ===== */}
       <div className="fixed bottom-4 right-4 z-[110] flex w-[calc(100%-2rem)] max-w-sm flex-col gap-2">
         {toasts.map((t) => (
-          <div key={t.id} className="flex gap-3 rounded-2xl border border-[#d4ff3f]/30 bg-[#101013]/95 p-3.5 shadow-2xl backdrop-blur anim-slide-in">
+          <div key={t.id} className="flex gap-3 rounded-2xl border border-[#34d399]/30 bg-[#101013]/95 p-3.5 shadow-2xl backdrop-blur anim-slide-in">
             {t.icon ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img src={t.icon} alt="" onError={(e) => { (e.target as HTMLImageElement).src = FALLBACK_ICON; }} className="h-10 w-10 shrink-0 rounded-lg border border-zinc-800 bg-zinc-900 object-contain p-1" />
             ) : (
-              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-[#d4ff3f]/15 text-[#d4ff3f]">
+              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-[#34d399]/15 text-[#34d399]">
                 <Settings2 className="h-5 w-5" />
               </span>
             )}

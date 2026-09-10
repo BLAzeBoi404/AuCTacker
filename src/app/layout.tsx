@@ -8,7 +8,7 @@ export const metadata: Metadata = {
     "AucTracker: цены, активные лоты, история продаж и уведомления о лотах аукциона STALCRAFT. Слежка по заточке, редкости и цене.",
   themeColor: "#060607",
   icons: {
-    icon: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0a0c'/%3E%3Ctext x='32' y='45' font-family='Arial,sans-serif' font-size='36' font-weight='bold' text-anchor='middle' fill='%23d4ff3f'%3EA%3C/text%3E%3C/svg%3E",
+    icon: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0a0c'/%3E%3Ctext x='32' y='45' font-family='Arial,sans-serif' font-size='36' font-weight='bold' text-anchor='middle' fill='%2334d399'%3EA%3C/text%3E%3C/svg%3E",
   },
 };
 

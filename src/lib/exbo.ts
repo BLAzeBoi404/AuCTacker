@@ -277,6 +277,23 @@ interface ListingEntry {
   name?: { lines?: { ru?: string; en?: string } };
 }
 
+// Нормализуем категорию, чтобы в каталоге были понятные разделы:
+// детекторы/устройства (Пионер, САК, Эльбрус) выносятся из «оружия» в «Устройства»,
+// броня едина, патроны едины, модули — в обвесы.
+function normalizeCategory(parts: string[]): string {
+  const seg = parts.map((p) => p.toLowerCase());
+  const first: string = seg[0] || "other";
+  if (first !== "items") return first;
+  const cats = seg.slice(1, -1); // например ["weapon","device"]
+  if (cats.length === 0) return "other";
+  if (cats.includes("device") || cats.includes("detector")) return "device";
+  if (cats.includes("artefact") || cats.includes("artifact")) return "artefact";
+  if (cats[0] === "weapon_modules") return "attachment";
+  if (cats[0] === "armor" || cats[0] === "armour") return "armor";
+  if (cats[0] === "ammo" || cats[0] === "bullet") return "ammo";
+  return cats[0];
+}
+
 function entryToItem(e: ListingEntry) {
   const dataPath: string = e.data || "";
   const file = dataPath.split("/").pop() || "";
@@ -284,21 +301,17 @@ function entryToItem(e: ListingEntry) {
   if (!id) return null;
   const nameRu = e.name?.lines?.ru || id;
   const nameEn = e.name?.lines?.en || "";
-  // категория: /items/weapon/pistol/xxxx.json -> weapon/pistol
   const parts = dataPath.split("/").filter(Boolean);
-  let category = "other";
-  if (parts[0] === "items" && parts.length >= 3) {
-    category = parts.slice(1, -1).join("/");
-  } else if (e.category) {
-    category = e.category;
-  }
+  const category = normalizeCategory(parts.length >= 3 ? parts : ["items", "other", file]);
+  const sub =
+    parts.length >= 4 ? parts[2] : null; // подраздел (например "device" для weapon/device)
   const iconUrl = e.icon ? `${DB_BASE}${e.icon}` : `${DB_BASE}/icons/other/${id}.png`;
   return {
     id,
     nameRu,
     nameEn,
     category,
-    subcategory: category.split("/")[1] || null,
+    subcategory: sub,
     iconUrl,
     color: e.color || null,
     dataPath,
@@ -357,12 +370,30 @@ export async function syncItemsFromGithub(): Promise<{ count: number }> {
 export async function ensureItemsSeeded(): Promise<number> {
   // Если таблицы нет (свежий Neon) — count упадёт: создаём схему и пробуем снова,
   // а не возвращаем молча ноль
+  const both = async () =>
+    syncItemsFromGithub().then((r) => r.count);
+
+  // Проверка: изменился ли формат категорий (старое "weapon/device" -> "device").
+  // Если да — переиндексируем один раз, чтобы разделы в каталоге были правильными.
+  const needsRecat = async (): Promise<boolean> => {
+    try {
+      const res = await db.execute(
+        sql`select count(*)::int as c from items where category like '%/%'`
+      );
+      return Number((res.rows[0] as { c: number })?.c || 0) > 50;
+    } catch {
+      return false;
+    }
+  };
+
   try {
     const cnt = await db.execute(sql`select count(*)::int as c from items`);
     const c = Number((cnt.rows[0] as { c: number })?.c || 0);
-    if (c > 100) return c;
-    const r = await syncItemsFromGithub();
-    return r.count;
+    if (c > 100) {
+      if (await needsRecat()) return both();
+      return c;
+    }
+    return both();
   } catch (e) {
     console.error("ensureItemsSeeded (first try) failed:", e);
   }
@@ -371,9 +402,11 @@ export async function ensureItemsSeeded(): Promise<number> {
     await ensureSchema();
     const cnt = await db.execute(sql`select count(*)::int as c from items`);
     const c = Number((cnt.rows[0] as { c: number })?.c || 0);
-    if (c > 100) return c;
-    const r = await syncItemsFromGithub();
-    return r.count;
+    if (c > 100) {
+      if (await needsRecat()) return both();
+      return c;
+    }
+    return both();
   } catch (e) {
     console.error("ensureItemsSeeded (retry) failed:", e);
     return 0;
