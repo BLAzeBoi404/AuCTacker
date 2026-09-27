@@ -1,0 +1,20 @@
+# Render Blueprint: деплой в 2 клика.
+# На Render: New → Blueprint → выбрать этот репозиторий.
+# Потом в Environment вписать 3 переменные (см. HOSTING.md).
+services:
+  - type: web
+    name: auctracker
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: DATABASE_URL
+        sync: false
+      - key: EXBO_CLIENT_ID
+        sync: false
+      - key: EXBO_CLIENT_SECRET
+        sync: false
