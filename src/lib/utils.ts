@@ -44,21 +44,6 @@ export function formatDate(dateStr: string | null | undefined): string {
   }
 }
 
-export function formatFullDate(dateStr: string | null | undefined): string {
-  if (!dateStr) return "—";
-  try {
-    return new Date(dateStr).toLocaleString("ru-RU", {
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return "—";
-  }
-}
-
 export function timeAgo(dateStr: string | Date | null | undefined): string {
   if (!dateStr) return "";
   const d = typeof dateStr === "string" ? new Date(dateStr) : dateStr;
@@ -72,17 +57,6 @@ export function timeAgo(dateStr: string | Date | null | undefined): string {
   const days = Math.floor(hours / 24);
   if (days < 30) return `${days} д назад`;
   return formatDate(d.toISOString());
-}
-
-export function debounce<T extends (...args: unknown[]) => void>(
-  fn: T,
-  wait: number
-): (...args: Parameters<T>) => void {
-  let t: ReturnType<typeof setTimeout> | null = null;
-  return (...args: Parameters<T>) => {
-    if (t) clearTimeout(t);
-    t = setTimeout(() => fn(...args), wait);
-  };
 }
 
 export const FALLBACK_ICON =

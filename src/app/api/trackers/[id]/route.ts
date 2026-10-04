@@ -4,6 +4,8 @@ import { trackers } from "@/db/schema";
 import { and, eq } from "drizzle-orm";
 import { getOwnerKey } from "@/lib/identity";
 import { ensureSchema } from "@/lib/ensure-schema";
+import { invalidateTrackerCache } from "@/lib/tracker-check";
+import { invalidateOwner } from "@/lib/user-cache";
 
 export const dynamic = "force-dynamic";
 
@@ -35,6 +37,8 @@ export async function PATCH(
     if (!row) {
       return NextResponse.json({ success: false, error: "not_found" }, { status: 404 });
     }
+    invalidateTrackerCache();
+    invalidateOwner(owner);
     return NextResponse.json({ success: true, tracker: row });
   } catch (e) {
     console.error("PATCH tracker failed:", e);
@@ -57,6 +61,8 @@ export async function DELETE(
     if (!row) {
       return NextResponse.json({ success: false, error: "not_found" }, { status: 404 });
     }
+    invalidateTrackerCache();
+    invalidateOwner(owner);
     return NextResponse.json({ success: true });
   } catch (e) {
     console.error("DELETE tracker failed:", e);

@@ -6,7 +6,7 @@ import {
   ChevronRight, ChevronDown, Star, TrendingUp, TrendingDown, Minus,
   Package, Gavel, History as HistoryIcon, Settings2,
   Check, Eye, EyeOff, Zap, Shield, Crosshair, Clock, Database, Swords,
-  FlaskConical, Backpack, Menu, CircleDot, ExternalLink,
+  FlaskConical, Backpack, CircleDot, ExternalLink,
   Info, Settings as SettingsIcon, Send, Copy, Link2, Server, Globe,
   KeyRound, MessageCircle, BarChart3, ArrowDown, ArrowUp, ShoppingBag,
 } from "lucide-react";
@@ -91,10 +91,34 @@ interface SchedulerInfo {
   lastRun: string | null;
   lastSummary: string | null;
   interval: number;
+  eco?: {
+    cached: boolean;
+    stateAgeSec: number | null;
+    syncSec: number | null;
+    pendingWrites: number;
+    trackersCached: number;
+  };
+}
+interface KeepAlive {
+  running: boolean;
+  intervalSec: number;
+  lastOk: string | null;
+  lastFail: string | null;
+  consecutiveFails: number;
+}
+interface DbUsage {
+  queries: number;
+  wakeWindows: number;
+  uptimeHours: number;
+  cuHoursUsed: number;
+  cuHoursPerDay: number;
+  cuHoursPerMonth: number;
+  limit: number;
 }
 interface SettingsState {
   scheduler_enabled: string;
   scheduler_interval: string;
+  db_sync_interval: string;
   site_url: string;
   telegram_enabled: string;
   telegram_has_token: string;
@@ -197,7 +221,7 @@ export default function AuctionApp() {
   const [view, setView] = useState<"home" | "auction" | "catalog" | "trackers" | "telegram" | "admin">("home");
   const [region, setRegion] = useState("EU");
   const [regionOpen, setRegionOpen] = useState(false);
-  const [mobileMenu, setMobileMenu] = useState(false);
+
   const [autoRefresh, setAutoRefresh] = useState(true);
 
   // ---------- Сессия (свой профиль + права админа) ----------
@@ -205,6 +229,12 @@ export default function AuctionApp() {
   const [adminConfigured, setAdminConfigured] = useState(false);
   const [adminPassword, setAdminPassword] = useState("");
   const [adminError, setAdminError] = useState("");
+  const [ownerShort, setOwnerShort] = useState("");
+
+  // ---------- Ручное добавление предмета (админ) ----------
+  const [adoptId, setAdoptId] = useState("");
+  const [adoptName, setAdoptName] = useState("");
+  const [adoptBusy, setAdoptBusy] = useState(false);
 
   // ---------- Мой Telegram (для страницы Telegram) ----------
   const [myTg, setMyTg] = useState<{
@@ -266,9 +296,7 @@ export default function AuctionApp() {
     upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1,
     maxPrice: 0, minPrice: 0,
   });
-  const [checkInterval, setCheckInterval] = useState(30);
   const [checking, setChecking] = useState(false);
-  const [lastCheck, setLastCheck] = useState<Date | null>(null);
 
   // ---------- Notifications ----------
   const [notifications, setNotifications] = useState<Notif[]>([]);
@@ -309,10 +337,8 @@ export default function AuctionApp() {
           setSearchQuery(itemName(parsed));
         } catch { /* ignore */ }
       }
-      const ci = lsGet("interval");
-      if (ci) setCheckInterval(Number(ci) || 30);
     } catch { /* ignore */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   useEffect(() => {
@@ -402,11 +428,12 @@ export default function AuctionApp() {
 
   const loadSession = useCallback(async () => {
     try {
-      const d = await fetchJson<{ success: boolean; isAdmin: boolean; adminConfigured: boolean }>(
+      const d = await fetchJson<{ success: boolean; isAdmin: boolean; adminConfigured: boolean; ownerKey: string }>(
         "/api/session"
       );
       setIsAdmin(!!d.isAdmin);
       setAdminConfigured(!!d.adminConfigured);
+      setOwnerShort(d.ownerKey || "");
     } catch { /* ignore */ }
   }, []);
 
@@ -528,25 +555,26 @@ export default function AuctionApp() {
   // ---------- Настройки / Telegram ----------
   const [settings, setSettings] = useState<SettingsState | null>(null);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
-  const [tgChats, setTgChats] = useState<TgChat[]>([]);
+  const [dbUsage, setDbUsage] = useState<DbUsage | null>(null);
+  const [keepAlive, setKeepAlive] = useState<KeepAlive | null>(null);
   const [tgBotUsername, setTgBotUsername] = useState<string | null>(null);
   const [tgTokenInput, setTgTokenInput] = useState("");
   const [tgBusy, setTgBusy] = useState(false);
-  const [linkCode, setLinkCode] = useState<string | null>(null);
-  const [linkDeep, setLinkDeep] = useState<string | null>(null);
   const [siteUrlInput, setSiteUrlInput] = useState("");
-  const [tgSelected, setTgSelected] = useState<string[] | null>(null); // null = всем привязанным
 
   const cronUrl =
     settings?.cron_secret && typeof window !== "undefined"
       ? `${window.location.origin}/api/cron/check?secret=${settings.cron_secret}`
       : "";
 
+
   const copyText = useCallback((s: string, label = "Скопировано") => {
     try {
-      const done = () => pushToast(label, s.length > 70 ? s.slice(0, 70) + "…" : s);
       if (navigator.clipboard?.writeText) {
-        navigator.clipboard.writeText(s).then(done, () => pushToast("Ошибка", "Скопируйте вручную."));
+        navigator.clipboard.writeText(s).then(
+          () => pushToast(label, s.length > 70 ? s.slice(0, 70) + "…" : s),
+          () => pushToast("Ошибка", "Скопируйте вручную."),
+        );
       } else {
         pushToast("Ошибка", "Скопируйте вручную.");
       }
@@ -557,10 +585,12 @@ export default function AuctionApp() {
 
   const loadSettings = useCallback(async () => {
     try {
-      const d = await fetchJson<{ success: boolean; settings: SettingsState; scheduler: SchedulerInfo }>("/api/settings");
+      const d = await fetchJson<{ success: boolean; settings: SettingsState; scheduler: SchedulerInfo; usage?: DbUsage }>("/api/settings");
       if (d.success) {
         setSettings(d.settings);
         setScheduler(d.scheduler);
+        setDbUsage(d.usage || null);
+        setKeepAlive((d as { keepAlive?: KeepAlive }).keepAlive || null);
         setSiteUrlInput(d.settings.site_url || "");
         setTgBotUsername(d.settings.telegram_bot_username || null);
       }
@@ -611,8 +641,6 @@ export default function AuctionApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "delete-token" }),
       });
-      setLinkCode(null);
-      setLinkDeep(null);
       await loadSettings();
       pushToast("Готово", "Токен бота удалён.");
     } catch {
@@ -620,68 +648,9 @@ export default function AuctionApp() {
     }
   }, [loadSettings, pushToast]);
 
-  const genLinkCode = useCallback(async () => {
-    setTgBusy(true);
-    try {
-      const d = await fetchJson<{ success: boolean; code?: string; deepLink?: string | null }>("/api/telegram", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "link-code" }),
-      });
-      if (d.success && d.code) {
-        setLinkCode(d.code);
-        setLinkDeep(d.deepLink || null);
-      } else {
-        pushToast("Ошибка", "Сначала сохраните токен бота.");
-      }
-    } catch {
-      pushToast("Ошибка", "Не удалось создать код.");
-    } finally {
-      setTgBusy(false);
-    }
-  }, [pushToast]);
 
-  const pollTgNow = useCallback(async () => {
-    setTgBusy(true);
-    try {
-      const d = await fetchJson<{ success: boolean; linked?: string[] }>("/api/telegram", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "poll" }),
-      });
-      await loadSettings();
-      if (d.linked && d.linked.length > 0) pushToast("Привязано!", `Новых чатов: ${d.linked.length}.`);
-      else pushToast("Проверка выполнена", "Новых привязок нет — отправьте /start с кодом боту.");
-    } catch {
-      pushToast("Ошибка", "Не удалось опросить Telegram.");
-    } finally {
-      setTgBusy(false);
-    }
-  }, [loadSettings, pushToast]);
 
-  const testTg = useCallback(async (chatId: string | null) => {
-    try {
-      await fetchJson("/api/telegram", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "test", chatId }),
-      });
-      pushToast("Отправлено", "Проверьте Telegram.");
-    } catch {
-      pushToast("Ошибка", "Не удалось отправить тест.");
-    }
-  }, [pushToast]);
 
-  const unlinkTg = useCallback(async (chatId: string) => {
-    try {
-      await fetchJson("/api/telegram", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "unlink", chatId }),
-      });
-      loadSettings();
-    } catch { /* ignore */ }
-  }, [loadSettings]);
 
   const regenCron = useCallback(async () => {
     try {
@@ -696,6 +665,36 @@ export default function AuctionApp() {
       pushToast("Ошибка", "Не удалось обновить секрет.");
     }
   }, [loadSettings, pushToast]);
+
+  const adoptItem = useCallback(async () => {
+    const id = adoptId.trim();
+    if (!id) return;
+    setAdoptBusy(true);
+    try {
+      const d = await fetchJson<{ success: boolean; message?: string; foundOnAuction?: boolean }>(
+        "/api/items/adopt",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, nameRu: adoptName.trim() }),
+        },
+        60000,
+      );
+      if (d.success) {
+        pushToast(d.foundOnAuction ? "Предмет добавлен" : "Добавлен (лотов нет)", d.message || "");
+        setAdoptId("");
+        setAdoptName("");
+        loadCatalog(catalogQuery, catalogCategory, 1);
+      } else {
+        pushToast("Ошибка", d.message || "Не удалось добавить предмет.");
+      }
+    } catch {
+      pushToast("Ошибка", "Не удалось добавить предмет.");
+    } finally {
+      setAdoptBusy(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adoptId, adoptName, catalogQuery, catalogCategory, pushToast]);
 
   const syncItems = useCallback(async () => {
     setCatalogSyncing(true);
@@ -905,7 +904,6 @@ export default function AuctionApp() {
         failed: number; apiLots: number; errors: string[];
         matches: { trackerId: number; itemId: string; itemName: string; itemIcon: string | null; price: number; upgrade: number; quality: number; qualityName: string; region: string }[];
       }>("/api/trackers/check", { method: "POST" });
-      setLastCheck(new Date());
       loadTrackers();
       loadNotifications();
       if (d.matches?.length > 0) {
@@ -1092,7 +1090,7 @@ export default function AuctionApp() {
             <span className="text-[15px] font-extrabold tracking-wide text-white">AucTracker</span>
           </button>
 
-          <nav className="ml-6 hidden items-center gap-1 md:flex">
+          <nav className="ml-2 flex flex-1 items-center gap-1 overflow-x-auto md:ml-6 md:flex-none [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             <button onClick={() => setView("auction")} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition ${view === "auction" ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"}`}>
               <Gavel className="h-3.5 w-3.5 shrink-0" />Аукцион
             </button>
@@ -1159,33 +1157,8 @@ export default function AuctionApp() {
               )}
             </button>
 
-            <button
-              onClick={() => setMobileMenu((v) => !v)}
-              className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-2 text-zinc-300 md:hidden"
-            >
-              <Menu className="h-4 w-4" />
-            </button>
           </div>
         </div>
-        {mobileMenu && (
-          <nav className="grid grid-cols-2 gap-2 border-t border-zinc-800 px-4 py-2 md:hidden">
-            {([
-              { v: "auction", t: "Аукцион" },
-              { v: "catalog", t: "Предметы" },
-              { v: "trackers", t: `Трекеры (${trackers.length})` },
-              { v: "telegram", t: "Telegram" },
-              ...(isAdmin ? [{ v: "admin" as const, t: "Админ" }] : []),
-            ] as const).map((item) => (
-              <button
-                key={item.v}
-                onClick={() => { setView(item.v); setMobileMenu(false); }}
-                className={`rounded-lg px-3 py-2 text-[13px] font-medium ${view === item.v ? "bg-zinc-800 text-white" : "text-zinc-400"}`}
-              >
-                {item.t}
-              </button>
-            ))}
-          </nav>
-        )}
       </header>
 
       <main className="relative mx-auto max-w-[1280px] px-4 pb-24 pt-5">
@@ -1743,29 +1716,27 @@ export default function AuctionApp() {
                 <h1 className="text-xl font-bold text-white">Мои трекеры</h1>
                 <p className="mt-0.5 text-[13px] text-zinc-500">
                   Активно: {enabledTrackers.length} из {trackers.length}
-                  {lastCheck && ` · последняя проверка ${timeAgo(lastCheck)}`}
+                  {ownerShort && (
+                    <span className="ml-1.5 rounded bg-zinc-800 px-1.5 py-0.5 text-[11px] text-zinc-400">
+                      профиль #{ownerShort}
+                    </span>
+                  )}
+                </p>
+                <p className="mt-1 text-[11.5px] text-zinc-600">
+                  Это ваш личный список — у друзей на их устройствах свои трекеры.
                 </p>
               </div>
               <div className="ml-auto flex flex-wrap items-center gap-2">
-                <select
-                  value={checkInterval}
-                  onChange={(e) => { const v = Number(e.target.value); setCheckInterval(v); lsSet("interval", String(v)); }}
-                  className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-2 text-[12.5px] text-zinc-200 outline-none"
-                  title="Интервал автопроверки"
-                >
-                  <option value={15}>Каждые 15 сек</option>
-                  <option value={30}>Каждые 30 сек</option>
-                  <option value={60}>Каждую минуту</option>
-                  <option value={120}>Каждые 2 мин</option>
-                </select>
-                <button
-                  onClick={() => checkTrackers(false)}
-                  disabled={checking || trackers.length === 0}
-                  className="flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-800 px-4 py-2 text-[13px] font-semibold text-white hover:bg-zinc-700 disabled:opacity-50"
-                >
-                  <RefreshCw className={`h-3.5 w-3.5 ${checking ? "animate-spin" : ""}`} />
-                  {checking ? "Проверка…" : "Проверить сейчас"}
-                </button>
+                {isAdmin && (
+                  <button
+                    onClick={() => checkTrackers(false)}
+                    disabled={checking || trackers.length === 0}
+                    className="flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-800 px-4 py-2 text-[13px] font-semibold text-white hover:bg-zinc-700 disabled:opacity-50"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${checking ? "animate-spin" : ""}`} />
+                    {checking ? "Проверка…" : "Проверить сейчас"}
+                  </button>
+                )}
                 <button
                   onClick={() => setShowTrackerModal(true)}
                   className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110"
@@ -1780,8 +1751,8 @@ export default function AuctionApp() {
                 <Crosshair className="mx-auto h-10 w-10 text-zinc-700" />
                 <p className="mt-3 text-[15px] font-semibold text-white">Пока нет ни одного трекера</p>
                 <p className="mx-auto mt-1 max-w-md text-[13px] text-zinc-500">
-                  Откройте любой предмет на аукционе и нажмите «Следить» — мы будем проверять лоты каждые {checkInterval} сек
-                  и присылать уведомление, когда появится заточка, редкость и цена под ваши условия.
+                  Откройте любой предмет на аукционе и нажмите «Следить». Сервер сам проверяет лоты
+                  и присылает вам в Telegram, когда появится нужная заточка, редкость и цена.
                 </p>
                 <button onClick={() => setView("catalog")} className="mt-4 rounded-xl bg-[#34d399] px-5 py-2.5 text-[13px] font-bold text-black">
                   Выбрать предмет
@@ -2106,10 +2077,64 @@ export default function AuctionApp() {
                     <span className="ml-auto rounded-full border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-[11px] font-medium text-zinc-400">Выключен</span>
                   )}
                 </div>
+                <div className={`mt-3 rounded-xl border p-3 ${
+                  keepAlive?.running && !keepAlive.consecutiveFails
+                    ? "border-emerald-500/25 bg-emerald-500/5"
+                    : "border-amber-500/30 bg-amber-500/10"
+                }`}>
+                  <p className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-200">
+                    <Shield className="h-3.5 w-3.5 text-[#34d399]" /> Самопробуждение
+                    {keepAlive?.running && (
+                      <span className={`ml-auto rounded-full px-2 py-0.5 text-[10.5px] font-medium ${
+                        keepAlive.consecutiveFails
+                          ? "bg-amber-500/15 text-amber-300"
+                          : "bg-emerald-500/15 text-emerald-300"
+                      }`}>
+                        {keepAlive.consecutiveFails ? `${keepAlive.consecutiveFails} неудач` : "работает"}
+                      </span>
+                    )}
+                  </p>
+                  <p className="mt-1 text-[11.5px] leading-relaxed text-zinc-500">
+                    Сервер сам пингует себя каждые {keepAlive?.intervalSec || 600} сек, чтобы Render
+                    не усыпил сайт. Этого достаточно без внешнего cron, но cron-job.org можно
+                    оставить как страховку.
+                    {keepAlive?.lastOk && ` Последний успешный пинг: ${timeAgo(keepAlive.lastOk)}.`}
+                  </p>
+                </div>
+
                 <p className="mt-1 text-[12.5px] leading-relaxed text-zinc-500">
                   Сервер сам проверяет трекеры и шлёт уведомления в Telegram — сайт держать открытым не нужно.
                   {scheduler?.lastRun ? ` Последняя проверка: ${timeAgo(scheduler.lastRun)}${scheduler.lastSummary ? ` (${scheduler.lastSummary})` : ""}.` : " Пока ни одной проверки."}
                 </p>
+
+                {dbUsage && (
+                  <div className={`mt-3 rounded-xl border p-3 ${
+                    dbUsage.cuHoursPerMonth > 90
+                      ? "border-red-500/40 bg-red-500/10"
+                      : dbUsage.cuHoursPerMonth > 70
+                        ? "border-amber-500/30 bg-amber-500/10"
+                        : "border-emerald-500/25 bg-emerald-500/5"
+                  }`}>
+                    <p className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-200">
+                      <BarChart3 className="h-3.5 w-3.5" /> Расход базы Neon (замер этого сервера)
+                    </p>
+                    <div className="mono mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-[11.5px] text-zinc-300 sm:grid-cols-4">
+                      <span>Прогноз: <b className={
+                        dbUsage.cuHoursPerMonth > 90 ? "text-red-300"
+                          : dbUsage.cuHoursPerMonth > 70 ? "text-amber-300" : "text-emerald-300"
+                      }>{dbUsage.cuHoursPerMonth}</b> / {dbUsage.limit} CU-ч в месяц</span>
+                      <span>В сутки: {dbUsage.cuHoursPerDay} CU-ч</span>
+                      <span>Пробуждений: {dbUsage.wakeWindows}</span>
+                      <span>Запросов: {dbUsage.queries}</span>
+                    </div>
+                    <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
+                      Neon считает время, пока база не спит (засыпает через 5 минут после
+                      последнего запроса), а не количество запросов. Замер идёт с последнего
+                      перезапуска сервера ({dbUsage.uptimeHours} ч).
+                      {dbUsage.cuHoursPerMonth > 70 && " Увеличьте интервал обращения к базе ниже."}
+                    </p>
+                  </div>
+                )}
 
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <button
@@ -2119,42 +2144,63 @@ export default function AuctionApp() {
                   >
                     <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${scheduler?.enabled ? "left-[22px]" : "left-0.5"}`} />
                   </button>
-                  <span className="text-[12.5px] text-zinc-300">Проверять каждые</span>
+                  <span className="text-[12.5px] text-zinc-300">Опрос EXBO каждые</span>
                   <select
                     value={settings?.scheduler_interval || "60"}
                     onChange={(e) => saveSettings({ scheduler_interval: e.target.value }, "Интервал обновлён")}
                     className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-[12.5px] text-zinc-200 outline-none"
                   >
-                    <option value="15">15 сек — нужен постоянно работающий сервер</option>
-                    <option value="30">30 сек — нужен постоянно работающий сервер</option>
-                    <option value="60">1 мин — для платного хостинга/VPS</option>
-                    <option value="120">2 мин — для платного хостинга/VPS</option>
+                    <option value="30">30 сек</option>
+                    <option value="60">1 мин — рекомендуется</option>
+                    <option value="120">2 мин</option>
                     <option value="300">5 мин</option>
-                    <option value="600">10 мин — тестовый Free-режим</option>
-                    <option value="900">15 мин — экономнее для Free</option>
+                    <option value="600">10 мин</option>
                   </select>
                 </div>
-                {Number(settings?.scheduler_interval || 60) < 600 && (
-                  <p className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11.5px] leading-relaxed text-amber-200">
-                    Опрос чаще 10 минут не даёт Neon Free гарантированно уснуть. Минимальный compute
-                    при непрерывной работе расходует около 180 CU-часов за 30 дней при бесплатном лимите 100.
-                    Для проверки каждую минуту нужен платный тариф или VPS.
-                  </p>
-                )}
+                <p className="mt-1.5 text-[11.5px] leading-relaxed text-zinc-500">
+                  Опрос аукциона идёт к серверам EXBO и на лимиты базы не влияет — держите 1 минуту,
+                  чтобы уведомления приходили быстро.
+                </p>
+
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <span className="text-[12.5px] text-zinc-300">Обращаться к базе не чаще, чем раз в</span>
+                  <select
+                    value={settings?.db_sync_interval || "1800"}
+                    onChange={(e) => saveSettings({ db_sync_interval: e.target.value }, "Режим экономии базы обновлён")}
+                    className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-[12.5px] text-zinc-200 outline-none"
+                  >
+                    <option value="300">5 мин — ~36 CU-ч/мес</option>
+                    <option value="600">10 мин — ~18 CU-ч/мес</option>
+                    <option value="900">15 мин — ~12 CU-ч/мес</option>
+                    <option value="1800">30 мин — ~6 CU-ч/мес (рекомендуется)</option>
+                    <option value="3600">60 мин — ~3 CU-ч/мес</option>
+                  </select>
+                </div>
+                <p className="mt-1.5 rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-[11.5px] leading-relaxed text-emerald-200/90">
+                  Режим экономии: список трекеров держится в памяти, база спит между синхронизациями.
+                  При лимите Neon Free в 100 CU-часов это позволяет работать круглосуточно весь месяц.
+                  Найденный лот записывается в базу сразу — уведомление не теряется.
+                  {scheduler?.eco?.stateAgeSec != null && (
+                    <> Сейчас: кэш обновлён {scheduler.eco.stateAgeSec} сек назад,
+                    трекеров в памяти {scheduler.eco.trackersCached},
+                    отложенных записей {scheduler.eco.pendingWrites}.</>
+                  )}
+                </p>
 
                 <div className="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
                   <p className="flex items-center gap-1.5 text-[12px] font-medium text-zinc-300">
-                    <KeyRound className="h-3.5 w-3.5 text-zinc-500" /> Внешний cron-пинг (для бесплатного хостинга)
+                    <KeyRound className="h-3.5 w-3.5 text-zinc-500" /> Внешний cron-пинг — страховка (не обязательно)
                   </p>
                   <p className="mt-0.5 text-[11.5px] leading-relaxed text-zinc-500">
-                    Зачем это нужно: сайт на бесплатном хостинге засыпает, когда его никто не открывает. Этот адрес его будит и запускает проверку трекеров. Настраивается один раз за 5 минут:
+                    Сайт теперь сам себя пингует и не даёт Render себя усыпить. Cron не обязателен,
+                    но добавит надёжности на случай перезапуска сервера:
                   </p>
                   <ol className="mt-1.5 list-decimal space-y-1 pl-5 text-[11.5px] leading-relaxed text-zinc-400">
                     <li>Зарегистрируйтесь на <b className="text-zinc-200">cron-job.org</b> (бесплатно) и войдите.</li>
                     <li>Нажмите <b className="text-zinc-200">Create cronjob</b>.</li>
                     <li>В поле <b className="text-zinc-200">Title</b> напишите что угодно, например auctracker.</li>
                     <li>В поле <b className="text-zinc-200">Address (URL)</b> вставьте адрес из строки ниже — целиком, вместе с secret.</li>
-                    <li>Для тестового Free-режима поставьте <b className="text-zinc-200">каждые 10–15 минут</b>. Для проверки каждую минуту используйте подходящий платный тариф/VPS.</li>
+                    <li>Интервал — <b className="text-zinc-200">каждые 10 минут</b>. Этого хватает, чтобы Render не заснул (порог 15 минут), а расход часов остался в бесплатном лимите.</li>
                   </ol>
                   <p className="mt-1.5 text-[11.5px] text-zinc-500">
                     Как понять, что работает: строка «Последняя проверка» выше обновляется по расписанию, даже когда сайт закрыт.
@@ -2224,6 +2270,37 @@ export default function AuctionApp() {
                   >
                     Обновить базу
                   </button>
+                </div>
+
+                <div className="mt-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
+                  <p className="text-[12px] font-medium text-zinc-300">Добавить предмет вручную</p>
+                  <p className="mt-0.5 text-[11.5px] leading-relaxed text-zinc-500">
+                    Некоторых предметов нет в справочнике EXBO, хотя они есть на аукционе
+                    (например «Боевой набор»). Найдите ID предмета на stalcraftdb.net или
+                    stalcraft.wiki — он в адресе страницы — и добавьте сюда.
+                    Существующие трекеры это не затронет.
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <input
+                      value={adoptId}
+                      onChange={(e) => setAdoptId(e.target.value)}
+                      placeholder="ID, напр. y4n2k"
+                      className="mono w-36 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-[12.5px] text-white outline-none placeholder-zinc-600 focus:border-[#34d399]/60"
+                    />
+                    <input
+                      value={adoptName}
+                      onChange={(e) => setAdoptName(e.target.value)}
+                      placeholder="Название, напр. Боевой набор"
+                      className="min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-[12.5px] text-white outline-none placeholder-zinc-600 focus:border-[#34d399]/60"
+                    />
+                    <button
+                      onClick={adoptItem}
+                      disabled={adoptBusy || !adoptId.trim()}
+                      className="rounded-xl bg-[#34d399] px-4 py-2 text-[12.5px] font-bold text-black hover:brightness-110 disabled:opacity-50"
+                    >
+                      {adoptBusy ? "Проверяю…" : "Добавить"}
+                    </button>
+                  </div>
                 </div>
               </section>
 

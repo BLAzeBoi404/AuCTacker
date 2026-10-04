@@ -4,6 +4,7 @@ import { notifications } from "@/db/schema";
 import { and, desc, eq } from "drizzle-orm";
 import { getOwnerKey } from "@/lib/identity";
 import { ensureSchema } from "@/lib/ensure-schema";
+import { cached, invalidateOwner } from "@/lib/user-cache";
 
 export const dynamic = "force-dynamic";
 
@@ -14,12 +15,12 @@ export async function GET(req: NextRequest) {
     const owner = await getOwnerKey();
     const { searchParams } = new URL(req.url);
     const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") || 30)));
-    const rows = await db
-      .select()
-      .from(notifications)
-      .where(eq(notifications.ownerKey, owner))
-      .orderBy(desc(notifications.createdAt))
-      .limit(limit);
+    const rows = await cached(`notif:${limit}:${owner}`, () =>
+      db.select().from(notifications)
+        .where(eq(notifications.ownerKey, owner))
+        .orderBy(desc(notifications.createdAt))
+        .limit(limit),
+    );
     const unread = rows.filter((r) => !r.isRead).length;
     return NextResponse.json({ success: true, notifications: rows, unread });
   } catch (e) {
@@ -38,11 +39,13 @@ export async function PATCH(req: NextRequest) {
         .update(notifications)
         .set({ isRead: true })
         .where(and(eq(notifications.ownerKey, owner), eq(notifications.isRead, false)));
+      invalidateOwner(owner);
     } else if (body.id) {
       await db
         .update(notifications)
         .set({ isRead: true })
         .where(and(eq(notifications.ownerKey, owner), eq(notifications.id, Number(body.id))));
+      invalidateOwner(owner);
     }
     return NextResponse.json({ success: true });
   } catch (e) {
@@ -56,6 +59,7 @@ export async function DELETE() {
     await ensureSchema();
     const owner = await getOwnerKey();
     await db.delete(notifications).where(eq(notifications.ownerKey, owner));
+    invalidateOwner(owner);
     return NextResponse.json({ success: true });
   } catch {
     return NextResponse.json({ success: false }, { status: 500 });

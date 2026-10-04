@@ -2,6 +2,7 @@ import { db } from "@/db";
 import { telegramChats, trackers, telegramCodes } from "@/db/schema";
 import { and, eq, lt } from "drizzle-orm";
 import { getSetting, setSetting } from "./settings";
+import { invalidateTrackerCache } from "./tracker-check";
 
 export async function getBotToken(): Promise<string | null> {
   const s = await getSetting("telegram_bot_token");
@@ -199,6 +200,7 @@ export async function pollTelegramUpdates(): Promise<{
               set: { ownerKey, name, isActive: true, linkedAt: new Date() },
             });
           linked.push(chatId);
+          invalidateTrackerCache(); // новый чат должен попасть в ближайшую проверку
           await sendTelegramMessage(
             chatId,
             `✅ <b>Telegram привязан!</b>\n\nСюда будут приходить уведомления по вашим трекерам.` +

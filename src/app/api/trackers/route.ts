@@ -5,6 +5,8 @@ import { and, desc, eq } from "drizzle-orm";
 import { normalizeRegion } from "@/lib/exbo";
 import { getOwnerKey } from "@/lib/identity";
 import { ensureSchema } from "@/lib/ensure-schema";
+import { invalidateTrackerCache } from "@/lib/tracker-check";
+import { cached, invalidateOwner } from "@/lib/user-cache";
 
 export const dynamic = "force-dynamic";
 
@@ -15,11 +17,10 @@ export async function GET() {
   try {
     await ensureSchema();
     const owner = await getOwnerKey();
-    const rows = await db
-      .select()
-      .from(trackers)
-      .where(eq(trackers.ownerKey, owner))
-      .orderBy(desc(trackers.createdAt));
+    // Из памяти, если читали недавно — база не просыпается
+    const rows = await cached(`trackers:${owner}`, () =>
+      db.select().from(trackers).where(eq(trackers.ownerKey, owner)).orderBy(desc(trackers.createdAt)),
+    );
     return NextResponse.json({ success: true, trackers: rows });
   } catch (e) {
     console.error("GET /api/trackers failed:", e);
@@ -69,6 +70,8 @@ export async function POST(req: NextRequest) {
         notifyChatIds: [],
       })
       .returning();
+    invalidateTrackerCache(); // новый трекер должен попасть в ближайшую проверку
+    invalidateOwner(owner);
     return NextResponse.json({ success: true, tracker: row });
   } catch (e) {
     console.error("POST /api/trackers failed:", e);

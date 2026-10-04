@@ -19,5 +19,11 @@ export async function register() {
     } catch (e) {
       console.error("scheduler start failed:", e);
     }
+    try {
+      const { ensureKeepAlive } = await import("./lib/keep-alive");
+      ensureKeepAlive();
+    } catch (e) {
+      console.error("keep-alive start failed:", e);
+    }
   }
 }

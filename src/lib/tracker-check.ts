@@ -5,7 +5,7 @@ import { ExboApiError, fetchLots, type NormalizedLot } from "./exbo";
 import { QUALITY_NAMES } from "./constants";
 import { getSetting } from "./settings";
 import { getActiveChats, sendTelegramMessage, esc } from "./telegram";
-import { telegramChats } from "@/db/schema";
+import { invalidateAll } from "./user-cache";
 
 export interface CheckMatch {
   trackerId: number;
@@ -31,15 +31,132 @@ export interface CheckResult {
   failed: number;
   apiLots: number;
   errors: string[];
+  /** Обращались ли к базе в этом цикле (для экономии CU-часов Neon) */
+  dbTouched: boolean;
+  /** Возраст кэша состояния в секундах */
+  stateAgeSec: number;
 }
 
+type TrackerRow = typeof trackers.$inferSelect;
+type ChatRow = { chatId: string; name: string | null; ownerKey: string | null };
+
+/**
+ * ЭКОНОМИЯ БАЗЫ (важно для бесплатного Neon).
+ *
+ * Neon Free даёт 100 CU-часов в месяц и засыпает после 5 минут без запросов.
+ * Если дёргать базу каждую минуту, она не спит никогда: 0.25 CU × 730 ч ≈ 180
+ * CU-часов — лимит кончается примерно на 17-й день.
+ *
+ * Поэтому: список трекеров и чатов держим в памяти и обновляем редко
+ * (db_sync_interval, по умолчанию 15 минут). Аукцион EXBO при этом опрашиваем
+ * часто — это внешний API, он на счётчик Neon не влияет.
+ *
+ * К базе идём только когда это действительно нужно:
+ *   1) плановая синхронизация состояния;
+ *   2) найден новый лот (запись уведомления + отметка «просмотрено»);
+ *   3) пользователь открыл сайт (обычные запросы страниц).
+ *
+ * Между этими моментами база спит и CU-часы не тратятся.
+ */
+interface EcoState {
+  trackers: TrackerRow[];
+  chats: ChatRow[];
+  telegramEnabled: boolean;
+  siteUrl: string;
+  syncMs: number;
+  /** Включён ли фоновый трекинг */
+  schedulerEnabled: boolean;
+  /** Как часто опрашивать EXBO (внешний API, базу не трогает) */
+  checkIntervalMs: number;
+  loadedAt: number;
+}
+
+let state: EcoState | null = null;
 let activeCheck: Promise<CheckResult> | null = null;
+let hasPendingDeliveries = false;
+
+/** Отложенные записи: копятся в памяти, уходят в базу одной пачкой */
+interface PendingWrite {
+  lastSeenLotIds: string[];
+  /** null — трекер ещё ни разу не проверялся успешно (базовый снимок не снят) */
+  lastCheckedAt: Date | null;
+  lastResultCount: number;
+  lastApiTotal: number;
+  lastError: string | null;
+}
+const pending = new Map<number, PendingWrite>();
+
+/** Сбросить кэш — вызывается при создании/изменении/удалении трекера */
+export function invalidateTrackerCache(): void {
+  state = null;
+}
 
 function priceLabel(min: number, max: number): string {
   if (min > 0 && max > 0) return `${min.toLocaleString("ru-RU")}–${max.toLocaleString("ru-RU")} ₽`;
   if (min > 0) return `от ${min.toLocaleString("ru-RU")} ₽`;
   if (max > 0) return `до ${max.toLocaleString("ru-RU")} ₽`;
   return "любая цена";
+}
+
+/** Записывает накопленные изменения трекеров одной пачкой */
+async function flushPending(): Promise<boolean> {
+  if (pending.size === 0) return false;
+  const entries = [...pending.entries()];
+  pending.clear();
+  for (const [id, w] of entries) {
+    try {
+      await db.update(trackers).set({
+        lastSeenLotIds: w.lastSeenLotIds.slice(0, 2000),
+        lastCheckedAt: w.lastCheckedAt,
+        lastResultCount: w.lastResultCount,
+        lastApiTotal: w.lastApiTotal,
+        lastError: w.lastError,
+      }).where(eq(trackers.id, id));
+    } catch (e) {
+      console.error("flushPending failed for tracker", id, e);
+    }
+  }
+  return true;
+}
+
+async function loadState(): Promise<EcoState> {
+  await flushPending();
+  const rows = await db.select().from(trackers);
+  const telegramEnabled = ((await getSetting("telegram_enabled")) ?? "1") === "1";
+  const siteUrl = ((await getSetting("site_url")) || "").replace(/\/$/, "");
+  const syncSec = Math.min(3600, Math.max(60, Number(await getSetting("db_sync_interval")) || 1800));
+  const schedulerEnabled = ((await getSetting("scheduler_enabled")) ?? "1") === "1";
+  const checkSec = Math.min(3600, Math.max(30, Number(await getSetting("scheduler_interval")) || 60));
+  const chats = telegramEnabled ? await getActiveChats() : [];
+
+  // Раз в цикл синхронизации подчищаем историю уведомлений
+  try {
+    await db.execute(
+      sql`delete from notifications where id not in (select id from notifications order by created_at desc limit 300)`
+    );
+  } catch {
+    /* очистка не должна ломать проверку */
+  }
+
+  hasPendingDeliveries = true; // после перезапуска проверим неотправленные
+  return {
+    trackers: rows,
+    chats,
+    telegramEnabled,
+    siteUrl,
+    syncMs: syncSec * 1000,
+    schedulerEnabled,
+    checkIntervalMs: checkSec * 1000,
+    loadedAt: Date.now(),
+  };
+}
+
+/** Конфиг планировщика из кэша — без обращения к базе */
+export function getRuntimeConfig(): { enabled: boolean; checkIntervalMs: number } {
+  return {
+    enabled: state ? state.schedulerEnabled : true,
+    checkIntervalMs: state ? state.checkIntervalMs : 60_000,
+  };
 }
 
 async function fetchAllLots(itemId: string, region: string): Promise<{ lots: NormalizedLot[]; total: number }> {
@@ -57,28 +174,34 @@ async function fetchAllLots(itemId: string, region: string): Promise<{ lots: Nor
   return { lots: [...new Map(result.map((lot) => [lot.id, lot])).values()], total };
 }
 
-async function deliverPending(
-  chats: Awaited<ReturnType<typeof getActiveChats>>,
-  siteUrl: string,
-): Promise<number> {
-  const pending = await db.select().from(notifications).where(and(
+/** Дослать уведомления, которые не ушли с первой попытки */
+async function deliverPending(chats: ChatRow[], siteUrl: string): Promise<number> {
+  const rows = await db.select().from(notifications).where(and(
     isNull(notifications.sentAt),
     lte(notifications.retryAt, new Date()),
     gt(notifications.createdAt, new Date(Date.now() - 24 * 60 * 60 * 1000)),
   )).orderBy(asc(notifications.id)).limit(20);
 
+  if (rows.length === 0) {
+    hasPendingDeliveries = false;
+    return 0;
+  }
+
   let delivered = 0;
-  for (const notification of pending) {
-    const requested = Array.isArray(notification.targetChatIds) && notification.targetChatIds.length
-      ? notification.targetChatIds
-      : chats.map((chat) => chat.chatId);
+  for (const notification of rows) {
+    // Досылаем только тем чатам, кому это уведомление адресовано.
+    // Если адресатов нет — помечаем как доставленное и больше не трогаем.
+    const requested = Array.isArray(notification.targetChatIds)
+      ? notification.targetChatIds.filter((chatId) =>
+          chats.some((chat) => chat.chatId === chatId),
+        )
+      : [];
     const sent = new Set(Array.isArray(notification.sentChatIds) ? notification.sentChatIds : []);
     let lastError: string | null = null;
 
     for (const chatId of requested) {
       if (sent.has(chatId)) continue;
-      const chat = chats.find((candidate) => candidate.chatId === chatId);
-      if (!chat) {
+      if (!chats.some((c) => c.chatId === chatId)) {
         lastError = "Telegram-чат отключён или не найден";
         continue;
       }
@@ -98,7 +221,7 @@ async function deliverPending(
       await new Promise((resolve) => setTimeout(resolve, 350));
     }
 
-    const complete = requested.length > 0 && requested.every((chatId) => sent.has(chatId));
+    const complete = requested.every((chatId) => sent.has(chatId));
     const attempts = notification.attempts + 1;
     await db.update(notifications).set({
       targetChatIds: requested,
@@ -106,9 +229,10 @@ async function deliverPending(
       attempts,
       sentAt: complete ? new Date() : null,
       retryAt: complete ? new Date() : new Date(Date.now() + Math.min(60 * 60 * 1000, 30000 * 2 ** Math.min(attempts, 6))),
-      deliveryError: complete ? null : (lastError || "Нет активного Telegram-чата"),
+      deliveryError: complete ? null : (lastError || "Адресат недоступен или не привязан"),
     }).where(eq(notifications.id, notification.id));
   }
+  hasPendingDeliveries = true;
   return delivered;
 }
 
@@ -122,33 +246,40 @@ async function check(source: string): Promise<CheckResult> {
     failed: 0,
     apiLots: 0,
     errors: [],
+    dbTouched: false,
+    stateAgeSec: 0,
   };
 
-  const all = await db.select().from(trackers);
-  const enabled = all.filter((tracker) => tracker.enabled);
+  // 1. Состояние: из памяти или из базы (редко)
+  let current = state;
+  if (!current || Date.now() - current.loadedAt > current.syncMs) {
+    current = await loadState();
+    state = current;
+    result.dbTouched = true;
+  }
+  result.stateAgeSec = Math.round((Date.now() - current.loadedAt) / 1000);
+
+  if (!current.schedulerEnabled && source === "scheduler") return result;
+
+  const enabled = current.trackers.filter((tracker) => tracker.enabled);
   if (!enabled.length) return result;
 
-  const groups = new Map<string, typeof enabled>();
+  const chatsByOwner = new Map<string, ChatRow[]>();
+  for (const chat of current.chats) {
+    if (!chat.ownerKey) continue;
+    chatsByOwner.set(chat.ownerKey, [...(chatsByOwner.get(chat.ownerKey) || []), chat]);
+  }
+
+  const groups = new Map<string, TrackerRow[]>();
   for (const tracker of enabled) {
     const key = `${tracker.region}|${tracker.itemId}`;
     groups.set(key, [...(groups.get(key) || []), tracker]);
   }
 
-  const telegramEnabled = ((await getSetting("telegram_enabled")) ?? "1") === "1";
-  const siteUrl = ((await getSetting("site_url")) || "").replace(/\/$/, "");
-  const activeChats = telegramEnabled ? await getActiveChats() : [];
-  // Карта: профиль пользователя -> его активные Telegram-чаты.
-  // Каждый трекер шлёт уведомления только владельцу.
-  const chatsByOwner = new Map<string, { chatId: string; name: string | null }[]>();
-  for (const chat of activeChats) {
-    if (!chat.ownerKey) continue;
-    const list = chatsByOwner.get(chat.ownerKey) || [];
-    list.push({ chatId: chat.chatId, name: chat.name });
-    chatsByOwner.set(chat.ownerKey, list);
-  }
-
   for (const [key, group] of groups) {
     const [region, itemId] = key.split("|");
+
+    // 2. Запрос к EXBO — внешний API, базу не трогает
     let snapshot: { lots: NormalizedLot[]; total: number };
     try {
       snapshot = await fetchAllLots(itemId, region);
@@ -158,7 +289,17 @@ async function check(source: string): Promise<CheckResult> {
       result.failed += group.length;
       result.errors.push(`${group[0].itemName}: ${message}`);
       for (const tracker of group) {
-        await db.update(trackers).set({ lastCheckedAt: new Date(), lastError: message }).where(eq(trackers.id, tracker.id));
+        tracker.lastError = message;
+        // ВАЖНО: lastCheckedAt НЕ трогаем при ошибке.
+        // Иначе трекер считался бы «уже проверенным» с пустым списком лотов,
+        // и первая же успешная проверка прислала бы разом весь аукцион.
+        pending.set(tracker.id, {
+          lastSeenLotIds: Array.isArray(tracker.lastSeenLotIds) ? tracker.lastSeenLotIds : [],
+          lastCheckedAt: tracker.lastCheckedAt ?? null,
+          lastResultCount: tracker.lastResultCount,
+          lastApiTotal: tracker.lastApiTotal,
+          lastError: message,
+        });
       }
       continue;
     }
@@ -167,10 +308,12 @@ async function check(source: string): Promise<CheckResult> {
       const seen = new Set(Array.isArray(tracker.lastSeenLotIds) ? tracker.lastSeenLotIds : []);
       const firstRun = tracker.lastCheckedAt === null && seen.size === 0;
       const currentIds = snapshot.lots.map((lot) => lot.id);
-      // Шлём только владельцу трекера. Старые трекеры без owner_key (общие) — всем, как раньше.
-      const targets = tracker.ownerKey
-        ? (chatsByOwner.get(tracker.ownerKey) || [])
-        : activeChats;
+      // Уведомления уходят ТОЛЬКО владельцу трекера.
+      // Раньше трекеры без owner_key (созданные до разделения профилей) шла всем
+      // привязанным чатам — поэтому друзья получали чужие уведомления.
+      // Теперь такой трекер никому не шлёт: владельцу достаточно открыть «Трекеры»
+      // и пересоздать его — новый будет привязан к его профилю автоматически.
+      const targets = tracker.ownerKey ? (chatsByOwner.get(tracker.ownerKey) || []) : [];
 
       const matching = snapshot.lots.filter((lot) => {
         const price = lot.buyoutPrice || lot.startPrice || 0;
@@ -187,6 +330,7 @@ async function check(source: string): Promise<CheckResult> {
       result.totalMatches += matching.length;
       if (firstRun) result.initialized++;
 
+      // Стартовый отчёт — один раз на трекер
       let reportSent = tracker.initialReportSent;
       if (!reportSent && targets.length) {
         const quality = tracker.targetQuality === -1 ? "любая редкость" : QUALITY_NAMES[tracker.targetQuality];
@@ -202,15 +346,23 @@ async function check(source: string): Promise<CheckResult> {
           + `EXBO вернул лотов: <b>${snapshot.total}</b>\n`
           + `Под условия подходит: <b>${matching.length}</b>\n`
           + `Условия: ${esc(upgrade)}, ${esc(quality)}, ${esc(priceLabel(tracker.minPrice, tracker.maxPrice))}\n\n`
-          + `Если лот уже виден в игре, но его нет на сайте, официальный API ещё не передал его. AuCTracker не может увидеть лот раньше EXBO.`;
+          + `Дальше сообщу, как только появится новый подходящий лот.`;
         for (const target of targets) {
           if (await sendTelegramMessage(target.chatId, report)) {
             result.telegramSent++;
             reportSent = true;
           }
         }
+        if (reportSent) {
+          tracker.initialReportSent = true;
+          try {
+            await db.update(trackers).set({ initialReportSent: true }).where(eq(trackers.id, tracker.id));
+            result.dbTouched = true;
+          } catch { /* повторим в следующий раз */ }
+        }
       }
 
+      // 3. Новые лоты — единственный случай, когда база нужна немедленно
       let newCount = 0;
       if (!firstRun) {
         for (const lot of matching) {
@@ -233,48 +385,89 @@ async function check(source: string): Promise<CheckResult> {
           result.matches.push(match);
           newCount++;
 
-          await db.insert(notifications).values({
-            ownerKey: tracker.ownerKey,
-            trackerId: tracker.id,
-            itemId: tracker.itemId,
-            itemName: tracker.itemName,
-            itemIcon: tracker.itemIcon,
-            region: tracker.region,
-            lotId: lot.id,
-            price,
-            upgrade: lot.upgrade,
-            quality: lot.quality,
-            qualityName: match.qualityName,
-            message: `+${lot.upgrade} • ${match.qualityName} • ${price.toLocaleString("ru-RU")} ₽`,
-            targetChatIds: targets.map((target) => target.chatId),
-            sentChatIds: [],
-            retryAt: new Date(),
-          }).onConflictDoNothing();
+          try {
+            await db.insert(notifications).values({
+              ownerKey: tracker.ownerKey,
+              trackerId: tracker.id,
+              itemId: tracker.itemId,
+              itemName: tracker.itemName,
+              itemIcon: tracker.itemIcon,
+              region: tracker.region,
+              lotId: lot.id,
+              price,
+              upgrade: lot.upgrade,
+              quality: lot.quality,
+              qualityName: match.qualityName,
+              message: `+${lot.upgrade} • ${match.qualityName} • ${price.toLocaleString("ru-RU")} ₽`,
+              targetChatIds: targets.map((target) => target.chatId),
+              sentChatIds: [],
+              retryAt: new Date(),
+            }).onConflictDoNothing();
+            result.dbTouched = true;
+            hasPendingDeliveries = true;
+            invalidateAll(); // у пользователя появилось новое уведомление
+          } catch (e) {
+            console.error("notification insert failed:", e);
+          }
         }
       }
 
-      await db.update(trackers).set({
-        lastSeenLotIds: currentIds.slice(0, 2000),
-        lastCheckedAt: new Date(),
-        lastResultCount: matching.length,
-        lastApiTotal: snapshot.total,
-        lastError: null,
-        initialReportSent: reportSent,
-        matchCount: tracker.matchCount + newCount,
-        ...(newCount ? { lastMatchedAt: new Date() } : {}),
-      }).where(eq(trackers.id, tracker.id));
+      // Обновляем состояние в памяти
+      tracker.lastSeenLotIds = currentIds.slice(0, 2000);
+      tracker.lastCheckedAt = new Date();
+      tracker.lastResultCount = matching.length;
+      tracker.lastApiTotal = snapshot.total;
+      tracker.lastError = null;
+      if (newCount) {
+        tracker.matchCount += newCount;
+        tracker.lastMatchedAt = new Date();
+      }
+
+      if (newCount) {
+        // Есть новые лоты — сохраняем сразу, чтобы после перезапуска не задвоить
+        try {
+          await db.update(trackers).set({
+            lastSeenLotIds: tracker.lastSeenLotIds,
+            lastCheckedAt: tracker.lastCheckedAt,
+            lastResultCount: tracker.lastResultCount,
+            lastApiTotal: tracker.lastApiTotal,
+            lastError: null,
+            matchCount: tracker.matchCount,
+            lastMatchedAt: tracker.lastMatchedAt,
+          }).where(eq(trackers.id, tracker.id));
+          pending.delete(tracker.id);
+          result.dbTouched = true;
+        } catch (e) {
+          console.error("tracker update failed:", e);
+        }
+      } else {
+        // Ничего нового — откладываем запись, база продолжает спать
+        pending.set(tracker.id, {
+          lastSeenLotIds: tracker.lastSeenLotIds,
+          lastCheckedAt: tracker.lastCheckedAt,
+          lastResultCount: tracker.lastResultCount,
+          lastApiTotal: tracker.lastApiTotal,
+          lastError: null,
+        });
+      }
     }
   }
 
-  result.telegramSent += await deliverPending(activeChats, siteUrl);
-
-  try {
-    await db.execute(sql`delete from notifications where id not in (select id from notifications order by created_at desc limit 300)`);
-  } catch {
-    // Очистка истории не должна ломать проверку.
+  // 4. Досылка застрявших уведомлений — только если есть что досылать
+  if (hasPendingDeliveries) {
+    try {
+      result.telegramSent += await deliverPending(current.chats, current.siteUrl);
+      result.dbTouched = true;
+    } catch (e) {
+      console.error("deliverPending failed:", e);
+    }
   }
 
-  console.log(`Tracker check [${source}]: checked=${result.checked}, apiLots=${result.apiLots}, matching=${result.totalMatches}, new=${result.matches.length}, telegram=${result.telegramSent}, failed=${result.failed}`);
+  console.log(
+    `Tracker check [${source}]: checked=${result.checked}, apiLots=${result.apiLots}, `
+    + `matching=${result.totalMatches}, new=${result.matches.length}, telegram=${result.telegramSent}, `
+    + `failed=${result.failed}, db=${result.dbTouched ? "yes" : "no"}, stateAge=${result.stateAgeSec}s`
+  );
   return result;
 }
 
@@ -286,4 +479,15 @@ export async function runTrackerCheck(source: string): Promise<CheckResult> {
   } finally {
     activeCheck = null;
   }
+}
+
+/** Статистика для админки: насколько экономно расходуется база */
+export function getEcoStatus() {
+  return {
+    cached: !!state,
+    stateAgeSec: state ? Math.round((Date.now() - state.loadedAt) / 1000) : null,
+    syncSec: state ? Math.round(state.syncMs / 1000) : null,
+    pendingWrites: pending.size,
+    trackersCached: state?.trackers.length ?? 0,
+  };
 }

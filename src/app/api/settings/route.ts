@@ -3,12 +3,17 @@ import { getSetting, setSetting, getOrCreateSecret } from "@/lib/settings";
 import { getSchedulerStatus, ensureScheduler } from "@/lib/scheduler";
 import { getBotUsername } from "@/lib/telegram";
 import { isAdmin } from "@/lib/identity";
+import { invalidateTrackerCache } from "@/lib/tracker-check";
+import { getDbUsage } from "@/db";
+import { getKeepAliveStatus } from "@/lib/keep-alive";
+import { getCatalogStatus } from "@/lib/catalog";
 
 export const dynamic = "force-dynamic";
 
 const PUBLIC_KEYS = [
   "scheduler_enabled",
   "scheduler_interval",
+  "db_sync_interval",
   "site_url",
   "telegram_enabled",
 ] as const;
@@ -37,6 +42,9 @@ export async function GET() {
         cron_secret: cronSecret,
       },
       scheduler,
+      usage: getDbUsage(),
+      catalog: getCatalogStatus(),
+      keepAlive: getKeepAliveStatus(),
     });
   } catch (e) {
     console.error("GET /api/settings failed:", e);
@@ -47,6 +55,7 @@ export async function GET() {
 const ALLOWED = new Set([
   "scheduler_enabled",
   "scheduler_interval",
+  "db_sync_interval",
   "site_url",
   "telegram_enabled",
 ]);
@@ -62,10 +71,13 @@ export async function PUT(req: NextRequest) {
       if (!ALLOWED.has(k)) continue;
       let val = String(v ?? "");
       if (k === "scheduler_enabled" || k === "telegram_enabled") val = val === "1" ? "1" : "0";
-      if (k === "scheduler_interval") val = String(Math.min(3600, Math.max(15, Number(val) || 60)));
+      if (k === "scheduler_interval") val = String(Math.min(3600, Math.max(30, Number(val) || 60)));
+      if (k === "db_sync_interval") val = String(Math.min(3600, Math.max(60, Number(val) || 1800)));
       if (k === "site_url") val = val.trim().replace(/\/$/, "");
       await setSetting(k, val);
     }
+    // Планировщик держит конфиг в памяти — сбрасываем, чтобы применилось сразу
+    invalidateTrackerCache();
     return NextResponse.json({ success: true });
   } catch (e) {
     console.error("PUT /api/settings failed:", e);

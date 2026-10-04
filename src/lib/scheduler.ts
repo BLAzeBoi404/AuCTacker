@@ -1,5 +1,4 @@
-import { getSetting } from "./settings";
-import { runTrackerCheck } from "./tracker-check";
+import { runTrackerCheck, getRuntimeConfig, getEcoStatus } from "./tracker-check";
 import { pollTelegramUpdates } from "./telegram";
 
 let timer: ReturnType<typeof setTimeout> | null = null;
@@ -7,41 +6,42 @@ let running = false;
 let lastRun: Date | null = null;
 let lastSummary: string | null = null;
 let started = false;
+let ticks = 0;
 
-// Встроенный планировщик: проверяет трекеры и почту Telegram-бота,
-// пока запущен сервер. Безопасно дублируется внешним cron-пингом.
+/**
+ * Фоновый планировщик.
+ *
+ * Раньше он читал настройки из базы на каждом тике — из-за этого Neon
+ * никогда не засыпал и бесплатные CU-часы кончались к середине месяца.
+ * Теперь конфиг берётся из кэша в памяти (tracker-check), а к базе
+ * обращаемся только по расписанию синхронизации или когда найден новый лот.
+ */
 async function tick() {
   timer = null;
-  try {
-    const enabled = ((await getSetting("scheduler_enabled")) ?? "1") === "1";
-    if (enabled && !running) {
-      running = true;
-      try {
-        const r = await runTrackerCheck("scheduler");
-        await pollTelegramUpdates();
-        lastRun = new Date();
-        lastSummary = `проверено: ${r.checked}, EXBO-лотов: ${r.apiLots}, совпадений: ${r.totalMatches}, новых: ${r.matches.length}, TG: ${r.telegramSent}, ошибок: ${r.failed}`;
-      } catch (e) {
-        lastRun = new Date();
-        lastSummary = `ошибка: ${String(e).slice(0, 120)}`;
-      } finally {
-        running = false;
-      }
+  if (!running) {
+    running = true;
+    try {
+      const r = await runTrackerCheck("scheduler");
+      ticks++;
+      // Почту бота проверяем реже: привязка по кнопке на сайте работает мгновенно,
+      // а фоновый опрос нужен лишь для тех, кто пишет боту напрямую.
+      if (ticks % 5 === 0) await pollTelegramUpdates();
+      lastRun = new Date();
+      lastSummary =
+        `трекеров: ${r.checked}, лотов EXBO: ${r.apiLots}, подходит: ${r.totalMatches}, `
+        + `новых: ${r.matches.length}, TG: ${r.telegramSent}, ошибок: ${r.failed}, `
+        + `база: ${r.dbTouched ? "запрос" : "спит"}`;
+    } catch (e) {
+      lastRun = new Date();
+      lastSummary = `ошибка: ${String(e).slice(0, 120)}`;
+    } finally {
+      running = false;
     }
-  } catch {
-    /* ignore */
   }
-  try {
-    const iv = Math.min(
-      3600,
-      Math.max(15, Number((await getSetting("scheduler_interval")) || 60))
-    );
-    timer = setTimeout(tick, iv * 1000);
-    timer.unref?.();
-  } catch {
-    timer = setTimeout(tick, 60000);
-    timer.unref?.();
-  }
+
+  const { checkIntervalMs } = getRuntimeConfig();
+  timer = setTimeout(tick, checkIntervalMs);
+  timer.unref?.();
 }
 
 export async function ensureScheduler() {
@@ -52,17 +52,15 @@ export async function ensureScheduler() {
 }
 
 export async function getSchedulerStatus() {
-  const enabled = ((await getSetting("scheduler_enabled")) ?? "1") === "1";
-  const interval = Math.min(
-    3600,
-    Math.max(15, Number((await getSetting("scheduler_interval")) || 60))
-  );
+  const cfg = getRuntimeConfig();
+  const eco = getEcoStatus();
   return {
     started,
-    enabled,
+    enabled: cfg.enabled,
     running,
     lastRun: lastRun ? lastRun.toISOString() : null,
     lastSummary,
-    interval,
+    interval: Math.round(cfg.checkIntervalMs / 1000),
+    eco,
   };
 }

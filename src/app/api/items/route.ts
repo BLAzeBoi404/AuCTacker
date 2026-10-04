@@ -1,68 +1,90 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { sql } from "drizzle-orm";
-import { ensureItemsSeeded } from "@/lib/exbo";
-import { ensureSchema } from "@/lib/ensure-schema";
+import { items } from "@/db/schema";
+import { fetchLots } from "@/lib/exbo";
+import { FALLBACK_ICON } from "@/lib/utils";
+import { searchCatalog, addToCatalog, type CatalogItem } from "@/lib/catalog";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Добавляет предмет, которого нет в справочнике EXBO, но который торгуется.
+ * Проверяем ID по регионам: если аукцион отдаёт лоты — предмет реальный.
+ */
+async function tryAdoptUnlistedItem(id: string): Promise<CatalogItem | null> {
+  for (const region of ["EU", "RU", "NA"]) {
+    try {
+      const { total } = await fetchLots(id, region, 1, 0);
+      if (total === 0) continue;
+
+      const row: CatalogItem = {
+        id,
+        nameRu: id.toUpperCase(),
+        nameEn: id.toUpperCase(),
+        category: "other",
+        subcategory: null,
+        iconUrl: FALLBACK_ICON,
+        color: null,
+        dataPath: null,
+        search: id.toLowerCase(),
+      };
+      await db
+        .insert(items)
+        .values({
+          id: row.id,
+          nameRu: row.nameRu,
+          nameEn: row.nameEn,
+          category: row.category,
+          subcategory: row.subcategory,
+          iconUrl: row.iconUrl,
+          color: row.color,
+          dataPath: row.dataPath,
+          searchText: row.search,
+        })
+        .onConflictDoNothing();
+      addToCatalog(row);
+      console.log(`Adopted unlisted item ${id} (found on ${region} auction)`);
+      return row;
+    } catch {
+      // регион недоступен — пробуем следующий
+    }
+  }
+  return null;
+}
+
 export async function GET(req: NextRequest) {
   try {
-    // На свежей базе таблиц может не быть — без этого count упадёт и вернётся вечный ноль
-    try {
-      await ensureSchema();
-    } catch (e) {
-      console.error("ensureSchema failed:", e);
-    }
-    await ensureItemsSeeded();
     const { searchParams } = new URL(req.url);
     const q = (searchParams.get("q") || "").trim();
     const category = (searchParams.get("category") || "").trim();
     const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") || 30)));
     const offset = Math.max(0, Number(searchParams.get("offset") || 0));
 
-    const qLike = `%${q.toLowerCase()}%`;
-    const qRaw = `%${q}%`;
-    const catLike = `${category}%`;
+    // Поиск идёт из памяти — база не просыпается
+    const found = await searchCatalog(q, category, limit, offset);
 
-    const rowsRes = await db.execute(sql`
-      select id, name_ru as "nameRu", name_en as "nameEn", category, subcategory, icon_url as "iconUrl", color, data_path as "dataPath"
-      from items
-      where (${q === ""} or search_text ilike ${qLike} or name_ru ilike ${qRaw} or id ilike ${qRaw})
-        and (${category === "" || category === "all"} or category ilike ${catLike})
-      order by
-        case when id = ${q.toLowerCase()} then 0
-             when name_ru ilike ${qRaw} then 1
-             else 2 end,
-        length(name_ru) asc
-      limit ${limit} offset ${offset}
-    `);
-
-    const countRes = await db.execute(sql`
-      select count(*)::int as c from items
-      where (${q === ""} or search_text ilike ${qLike} or name_ru ilike ${qRaw} or id ilike ${qRaw})
-        and (${category === "" || category === "all"} or category ilike ${catLike})
-    `);
-    const total = Number((countRes.rows[0] as unknown as { c: number })?.c || 0);
-
-    let categories: { category: string; count: number }[] = [];
-    try {
-      const catRes = await db.execute(sql`
-        select split_part(category, '/', 1) as category, count(*)::int as count
-        from items group by 1 order by 2 desc limit 30
-      `);
-      categories = catRes.rows as unknown as typeof categories;
-    } catch {
-      categories = [];
+    // Предмета нет в справочнике, но пользователь ввёл ID:
+    // часть предметов EXBO не публикует, хотя они торгуются на аукционе.
+    if (found.total === 0 && /^[a-z0-9]{3,12}$/i.test(q)) {
+      const adopted = await tryAdoptUnlistedItem(q.toLowerCase());
+      if (adopted) {
+        return NextResponse.json({
+          success: true,
+          items: [adopted],
+          total: 1,
+          categories: found.categories,
+          needsSync: false,
+          adopted: true,
+        });
+      }
     }
 
     return NextResponse.json({
       success: true,
-      items: rowsRes.rows,
-      total,
-      categories,
-      // Фронт по этому флагу показывает кнопку «Загрузить базу предметов»
-      needsSync: total === 0,
+      items: found.items,
+      total: found.total,
+      categories: found.categories,
+      needsSync: found.total === 0 && !q && !category,
     });
   } catch (e) {
     console.error("GET /api/items failed:", e);

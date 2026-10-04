@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { syncItemsFromGithub } from "@/lib/exbo";
 import { ensureSchema } from "@/lib/ensure-schema";
 import { isAdmin } from "@/lib/identity";
+import { invalidateCatalog } from "@/lib/catalog";
 
 export const dynamic = "force-dynamic";
 // Синхронизация тянет мегабайты с GitHub + пишет тысячи строк:
@@ -19,6 +20,7 @@ export async function POST() {
       console.error("ensureSchema failed:", e);
     }
     const r = await syncItemsFromGithub();
+    invalidateCatalog(); // каталог в памяти устарел — перечитаем при следующем запросе
     return NextResponse.json({ success: true, count: r.count });
   } catch (e) {
     console.error("sync failed:", e);

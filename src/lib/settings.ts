@@ -3,9 +3,13 @@ import { db } from "@/db";
 import { appSettings } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
-// Простое кэширование настроек в памяти, чтобы не дёргать БД на каждой проверке
+// Кэш настроек в памяти.
+// TTL большой намеренно: фоновые задачи не должны будить базу каждую минуту,
+// иначе Neon Free не засыпает и лимит CU-часов кончается к середине месяца.
+// Записи через setSetting сразу обновляют кэш, поэтому изменения из админки
+// применяются мгновенно, без ожидания TTL.
 const cache = new Map<string, { v: string | null; exp: number }>();
-const TTL_MS = 10000;
+const TTL_MS = 15 * 60 * 1000;
 
 export async function getSetting(key: string): Promise<string | null> {
   const c = cache.get(key);

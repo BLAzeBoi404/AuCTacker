@@ -56,14 +56,5 @@ export function categoryLabel(cat: string): string {
   return CATEGORY_LABELS[main] || CATEGORY_LABELS[cat.toLowerCase()] || "Разное";
 }
 
-// Популярные предметы для быстрого старта (реальные ID из игры)
-export const POPULAR_ITEMS = [
-  { id: "kqgy", name: "Браслет" },
-  { id: "gdj6", name: "Детектор узкого диапазона «Эльбрус»" },
-  { id: "qoq6", name: "Артефакт" },
-  { id: "gy06", name: "Артефакт" },
-  { id: "y1q9", name: "«Гадюка»" },
-];
-
 export const DB_BASE =
   "https://raw.githubusercontent.com/EXBO-Studio/stalzone-database/main/global";

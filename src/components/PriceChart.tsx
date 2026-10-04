@@ -253,6 +253,10 @@ export default function PriceChart({
     ctx.arc(xOf(mx.t), priceY(mx.price), 3.2, 0, Math.PI * 2);
     ctx.fillStyle = "#34d399";
     ctx.fill();
+    // xOf и priceY намеренно не в зависимостях: это чистые функции от
+    // model/innerW/innerH, которые пересоздаются на каждый рендер. Если их
+    // добавить, график будет перерисовываться бесконечно.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [width, height, model, innerW, innerH]);
 
   // Выбор точки по 2D-расстоянию до курсора (X и Y) — крестик показывает ту вершину, где курсор
