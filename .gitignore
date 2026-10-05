@@ -1,0 +1,28 @@
+# Зависимости
+node_modules/
+
+# Next.js
+.next/
+out/
+build/
+
+# Env — секреты НЕ пушим в git!
+.env
+.env.local
+.env*.local
+
+# Логи
+*.log
+npm-debug.log*
+
+# Система
+.DS_Store
+Thumbs.db
+
+# Редакторы
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Drizzle
+drizzle/*.sql
