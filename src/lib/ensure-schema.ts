@@ -175,6 +175,40 @@ export async function ensureSchema(): Promise<void> {
     await db.execute(sql`
       CREATE INDEX IF NOT EXISTS notifications_created_idx ON notifications (created_at DESC);
     `);
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS sell_trackers (
+        id serial PRIMARY KEY,
+        owner_key text,
+        item_id text NOT NULL,
+        item_name text NOT NULL,
+        item_icon text,
+        region text NOT NULL DEFAULT 'EU',
+        price integer NOT NULL DEFAULT 0,
+        amount integer NOT NULL DEFAULT 1,
+        upgrade integer NOT NULL DEFAULT 0,
+        quality integer NOT NULL DEFAULT 0,
+        quality_name text,
+        target_lot_id text,
+        start_time timestamp,
+        expected_end_time timestamp,
+        listed_duration_h integer,
+        status text NOT NULL DEFAULT 'active',
+        last_seen_at timestamp,
+        finished_at timestamp,
+        finish_price integer,
+        miss_count integer NOT NULL DEFAULT 0,
+        created_at timestamp DEFAULT now()
+      );
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS sell_trackers_owner_idx ON sell_trackers (owner_key);
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS sell_trackers_status_idx ON sell_trackers (status);
+    `);
+    await db.execute(sql`
+      ALTER TABLE notifications ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'buy';
+    `);
     done = true;
   })().catch((e) => {
     running = null;

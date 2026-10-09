@@ -19,38 +19,49 @@ export class ExboApiError extends Error {
 
 let cachedToken: string | null = null;
 let tokenExpiresAt = 0;
+// Блокировка параллельных запросов токена: без неё 5 одновременных вызовов
+// делали 5 одинаковых POST на exbo.net. Теперь ждёт один общий промис.
+let tokenPromise: Promise<string> | null = null;
 
 export async function getAccessToken(force = false): Promise<string> {
   if (!force && cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
+  if (!force && tokenPromise) return tokenPromise;
   if (!CLIENT_ID || !CLIENT_SECRET) {
     throw new ExboApiError("На сервере не заданы EXBO_CLIENT_ID/EXBO_CLIENT_SECRET", 503);
   }
-  let res: Response;
+  tokenPromise = (async () => {
+    let res: Response;
+    try {
+      const body = new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        scope: "",
+      });
+      res = await fetch("https://exbo.net/oauth/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+        cache: "no-store",
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch {
+      throw new ExboApiError("Сервер авторизации EXBO не ответил", 504);
+    }
+    if (!res.ok) {
+      throw new ExboApiError(`EXBO отклонил авторизацию (HTTP ${res.status})`, 502);
+    }
+    const data = (await res.json()) as { access_token?: string; expires_in?: number };
+    if (!data.access_token) throw new ExboApiError("EXBO не выдал токен доступа", 502);
+    cachedToken = data.access_token;
+    tokenExpiresAt = Date.now() + Math.max(30000, (data.expires_in || 3600) * 1000 - 60000);
+    return cachedToken as string;
+  })();
   try {
-    const body = new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      scope: "",
-    });
-    res = await fetch("https://exbo.net/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-      cache: "no-store",
-      signal: AbortSignal.timeout(15000),
-    });
-  } catch {
-    throw new ExboApiError("Сервер авторизации EXBO не ответил", 504);
+    return await tokenPromise;
+  } finally {
+    tokenPromise = null;
   }
-  if (!res.ok) {
-    throw new ExboApiError(`EXBO отклонил авторизацию (HTTP ${res.status})`, 502);
-  }
-  const data = (await res.json()) as { access_token?: string; expires_in?: number };
-  if (!data.access_token) throw new ExboApiError("EXBO не выдал токен доступа", 502);
-  cachedToken = data.access_token;
-  tokenExpiresAt = Date.now() + Math.max(30000, (data.expires_in || 3600) * 1000 - 60000);
-  return cachedToken;
 }
 
 export function normalizeRegion(r: string | null | undefined): string {
@@ -228,6 +239,78 @@ export async function fetchHistory(
    
   const history = d.prices.map((x, i) => normalizeHistory(x as any, i + offset));
   return { history, total: Number(d.total ?? history.length) || history.length };
+}
+
+// ---------- Параллельная загрузка страниц ----------
+// Раньше страницы тянулись строго по очереди: 500 лотов = 5 запросов
+// друг за другом (~5-8 сек ожидания). Теперь грузим пачками по 3 параллельно —
+// в 2-3 раза быстрее, а лимит EXBO (429) обрабатывается как обычная ошибка.
+const PAGE_CONCURRENCY = 3;
+const PAGE_SIZE = 100;
+
+async function runBatches<T>(offsets: number[], fn: (off: number) => Promise<T[]>): Promise<T[]> {
+  const out: T[] = [];
+  for (let i = 0; i < offsets.length; i += PAGE_CONCURRENCY) {
+    const batch = offsets.slice(i, i + PAGE_CONCURRENCY);
+    const parts = await Promise.all(batch.map(fn));
+    for (const p of parts) out.push(...p);
+    // Короткая страница = дальше данных нет
+    if (parts.some((p) => p.length < PAGE_SIZE)) break;
+  }
+  return out;
+}
+
+/** Все лоты предмета (до need) параллельными пачками. Свежие данные, без кэша. */
+export async function fetchLotsAll(
+  itemId: string,
+  regionRaw: string,
+  need = 500,
+): Promise<{ lots: NormalizedLot[]; total: number }> {
+  const region = normalizeRegion(regionRaw);
+  const id = itemId.trim();
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new ExboApiError("Некорректный ID предмета", 400);
+  const capped = Math.min(Math.max(1, Math.floor(need)), 2000);
+  const pages = Math.ceil(capped / PAGE_SIZE);
+  const offsets = Array.from({ length: pages }, (_, i) => i * PAGE_SIZE);
+  let total = 0;
+  const lots = await runBatches(offsets, async (off) => {
+    const r = await fetchLots(id, region, PAGE_SIZE, off);
+    total = r.total;
+    return r.lots;
+  });
+  const sliced = lots.slice(0, capped);
+  const uniq = [...new Map(sliced.map((l) => [l.id, l])).values()];
+  if (total > uniq.length && uniq.length >= capped) {
+    // взяли достаточно для отображения, total честно из API
+  }
+  return { lots: uniq, total: Number(total) || uniq.length };
+}
+
+/** История продаж (до need) параллельными пачками. Свежие данные, без кэша. */
+export async function fetchHistoryAll(
+  itemId: string,
+  regionRaw: string,
+  need = 400,
+): Promise<{ history: NormalizedHistory[]; total: number }> {
+  const region = normalizeRegion(regionRaw);
+  const id = itemId.trim();
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new ExboApiError("Некорректный ID предмета", 400);
+  const capped = Math.min(Math.max(1, Math.floor(need)), 2000);
+  const pages = Math.ceil(capped / PAGE_SIZE);
+  const offsets = Array.from({ length: pages }, (_, i) => i * PAGE_SIZE);
+  let total = 0;
+  const history = await runBatches(offsets, async (off) => {
+    const r = await fetchHistory(id, region, PAGE_SIZE, off);
+    total = r.total;
+    return r.history;
+  });
+  const sliced = history.slice(0, capped);
+  sliced.sort((a, b) => {
+    const ta = a.time ? new Date(a.time).getTime() : 0;
+    const tb = b.time ? new Date(b.time).getTime() : 0;
+    return tb - ta;
+  });
+  return { history: sliced, total: Number(total) || sliced.length };
 }
 
 // ---------- Словарь предметов ----------

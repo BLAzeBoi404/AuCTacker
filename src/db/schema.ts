@@ -51,6 +51,33 @@ export const trackers = pgTable("trackers", {
   createdAt: timestamp("created_at").defaultNow(),
 });
 
+// Трекеры ПРОДАЖ: пользователь выставил свой лот в игре и хочет знать,
+// продался он или истёк срок. Привязка идёт к конкретному лоту
+// (цена + количество + заточка + редкость + время окончания).
+export const sellTrackers = pgTable("sell_trackers", {
+  id: serial("id").primaryKey(),
+  ownerKey: text("owner_key"),
+  itemId: text("item_id").notNull(),
+  itemName: text("item_name").notNull(),
+  itemIcon: text("item_icon"),
+  region: text("region").notNull().default("EU"),
+  price: integer("price").notNull().default(0),
+  amount: integer("amount").notNull().default(1),
+  upgrade: integer("upgrade").notNull().default(0),
+  quality: integer("quality").notNull().default(0),
+  qualityName: text("quality_name"),
+  targetLotId: text("target_lot_id"),
+  startTime: timestamp("start_time"),
+  expectedEndTime: timestamp("expected_end_time"),
+  listedDurationH: integer("listed_duration_h"),
+  status: text("status").notNull().default("active"), // active | sold | expired
+  lastSeenAt: timestamp("last_seen_at"),
+  finishedAt: timestamp("finished_at"),
+  finishPrice: integer("finish_price"),
+  missCount: integer("miss_count").notNull().default(0),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
 // Уведомления о найденных лотах
 export const notifications = pgTable("notifications", {
   id: serial("id").primaryKey(),
@@ -67,6 +94,7 @@ export const notifications = pgTable("notifications", {
   qualityName: text("quality_name"),
   message: text("message"),
   isRead: boolean("is_read").notNull().default(false),
+  kind: text("kind").notNull().default("buy"), // buy | sell_sold | sell_expired
   targetChatIds: jsonb("target_chat_ids").$type<string[]>(),
   sentChatIds: jsonb("sent_chat_ids").$type<string[]>(),
   sentAt: timestamp("sent_at"),

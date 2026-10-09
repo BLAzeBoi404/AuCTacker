@@ -38,6 +38,7 @@ interface Lot {
   buyoutPrice: number;
   amount: number;
   endTime: string | null;
+  startTime?: string | null;
   upgrade: number;
   quality: number;
   qualityName: string;
@@ -144,6 +145,45 @@ interface Notif {
   isRead: boolean;
   createdAt: string;
 }
+interface SellTracker {
+  id: number;
+  itemId: string;
+  itemName: string;
+  itemIcon: string | null;
+  region: string;
+  price: number;
+  amount: number;
+  upgrade: number;
+  quality: number;
+  qualityName: string | null;
+  targetLotId: string | null;
+  startTime: string | null;
+  expectedEndTime: string | null;
+  listedDurationH: number | null;
+  status: "active" | "sold" | "expired";
+  lastSeenAt: string | null;
+  finishedAt: string | null;
+  finishPrice: number | null;
+  missCount: number;
+  createdAt: string;
+}
+
+const SELL_DURATIONS = [6, 12, 24, 48] as const;
+
+/** Длительность размещения по лоту: из разницы старт/конец, иначе 48 ч */
+function guessDurationH(lot: { startTime?: string | null; endTime?: string | null }): number {
+  try {
+    if (lot.startTime && lot.endTime) {
+      const h = Math.round((new Date(lot.endTime).getTime() - new Date(lot.startTime).getTime()) / 3_600_000);
+      let best: number = SELL_DURATIONS[SELL_DURATIONS.length - 1];
+      for (const d of SELL_DURATIONS) {
+        if (Math.abs(d - h) < Math.abs(best - h)) best = d;
+      }
+      return best;
+    }
+  } catch { /* ignore */ }
+  return 48;
+}
 interface Toast {
   id: number;
   title: string;
@@ -156,11 +196,16 @@ const itemName = (it: Item | null | undefined) =>
 const itemIcon = (it: Item | null | undefined) =>
   it?.iconUrl || it?.icon || FALLBACK_ICON;
 
-async function fetchJson<T>(url: string, opts?: RequestInit, timeoutMs = 20000): Promise<T> {
+async function fetchJson<T>(url: string, opts?: RequestInit, timeoutMs = 20000, externalSignal?: AbortSignal): Promise<T> {
   const ctrl = new AbortController();
+  if (externalSignal) {
+    if (externalSignal.aborted) ctrl.abort();
+    else externalSignal.addEventListener("abort", () => ctrl.abort(), { once: true });
+  }
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch(url, { cache: "no-store", ...opts, signal: ctrl.signal });
+    const { signal: _ignored, ...rest } = opts || {};
+    const r = await fetch(url, { cache: "no-store", ...rest, signal: ctrl.signal });
     const data = await r.json().catch(() => null) as (T & { success?: boolean; message?: string }) | null;
     if (!r.ok || data?.success === false) {
       throw new Error(data?.message || `HTTP ${r.status}`);
@@ -279,9 +324,17 @@ export default function AuctionApp() {
   const [lotsRefreshing, setLotsRefreshing] = useState(false);
   const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const lotsInflight = useRef(false);
-  const histInflight = useRef(false);
+  // Поколения запросов: ответ от прошлого предмета/региона никогда не перезапишет
+  // свежие данные. Старые inflight-флаги этим страдали — новый запрос просто
+  // отбрасывался, и на экране оставались цены предыдущего предмета.
+  const lotsGen = useRef(0);
+  const lotsAbort = useRef<AbortController | null>(null);
+  const histGen = useRef(0);
+  const histAbort = useRef<AbortController | null>(null);
   const searchSeq = useRef(0);
+  const searchAbort = useRef<AbortController | null>(null);
+  const catalogSeq = useRef(0);
+  const catalogAbort = useRef<AbortController | null>(null);
   const histCycle = useRef(0);
 
   // ---------- Filters ----------
@@ -306,6 +359,13 @@ export default function AuctionApp() {
     maxPrice: 0, minPrice: 0,
   });
   const [checking, setChecking] = useState(false);
+
+  // ---------- Трекеры продаж (мои выставленные лоты) ----------
+  const [sellTrackers, setSellTrackers] = useState<SellTracker[]>([]);
+  const [trackerTab, setTrackerTab] = useState<"buy" | "sell">("buy");
+  const [sellLot, setSellLot] = useState<Lot | null>(null);
+  const [sellDurationH, setSellDurationH] = useState<number>(48);
+  const [sellBusy, setSellBusy] = useState(false);
 
   // ---------- Notifications ----------
   const [notifications, setNotifications] = useState<Notif[]>([]);
@@ -369,10 +429,14 @@ export default function AuctionApp() {
   }, []);
 
   // ---------- Fetchers ----------
-  // silent=true: тихое фоновое обновление, экран не мигает
+  // silent=true: тихое фоновое обновление, экран не мигает.
+  // Каждый вызов получает своё поколение и свой AbortController: старый запрос
+  // отменяется, а его запоздалый ответ игнорируется и не затирает свежие данные.
   const fetchLots = useCallback(async (itemId: string, reg: string, silent = false) => {
-    if (lotsInflight.current) return;
-    lotsInflight.current = true;
+    const gen = ++lotsGen.current;
+    lotsAbort.current?.abort();
+    const abort = new AbortController();
+    lotsAbort.current = abort;
     if (silent) setLotsRefreshing(true);
     else {
       setLotsLoading(true);
@@ -380,41 +444,53 @@ export default function AuctionApp() {
     }
     try {
       const d = await fetchJson<{ success: boolean; lots: Lot[]; total: number }>(
-        `/api/lots?itemId=${encodeURIComponent(itemId)}&region=${reg}&limit=500`
+        `/api/lots?itemId=${encodeURIComponent(itemId)}&region=${reg}&limit=500`,
+        undefined,
+        20000,
+        abort.signal,
       );
+      if (lotsGen.current !== gen || abort.signal.aborted) return;
       setLots(d.lots || []);
       setLotsTotal(d.total || (d.lots || []).length);
       setLastUpdate(new Date());
       setNextRefreshAt(Date.now() + LOTS_MS);
     } catch (error) {
+      if (lotsGen.current !== gen || abort.signal.aborted) return;
       if (!silent) {
         setLots([]);
         setLotsTotal(0);
         setApiError(error instanceof Error ? error.message : "Не удалось загрузить официальный аукцион EXBO.");
       }
     } finally {
-      lotsInflight.current = false;
-      setLotsLoading(false);
-      setLotsRefreshing(false);
-      setNextRefreshAt(Date.now() + LOTS_MS);
+      if (lotsGen.current === gen) {
+        setLotsLoading(false);
+        setLotsRefreshing(false);
+        setNextRefreshAt(Date.now() + LOTS_MS);
+      }
     }
   }, []);
 
   const fetchHistory = useCallback(async (itemId: string, reg: string, silent = false) => {
-    if (histInflight.current) return;
-    histInflight.current = true;
+    const gen = ++histGen.current;
+    histAbort.current?.abort();
+    const abort = new AbortController();
+    histAbort.current = abort;
     if (!silent) setHistoryLoading(true);
     try {
       const d = await fetchJson<{ success: boolean; history: HistEntry[] }>(
-        `/api/history?itemId=${encodeURIComponent(itemId)}&region=${reg}&limit=600`
+        `/api/history?itemId=${encodeURIComponent(itemId)}&region=${reg}&limit=600`,
+        undefined,
+        20000,
+        abort.signal,
       );
+      if (histGen.current !== gen || abort.signal.aborted) return;
       setHistory(d.history || []);
       setHistoryLoaded(true);
     } catch {
+      if (histGen.current !== gen || abort.signal.aborted) return;
       if (!silent) setHistory([]);
     } finally {
-      histInflight.current = false;
-      setHistoryLoading(false);
+      if (histGen.current === gen) setHistoryLoading(false);
     }
   }, []);
 
@@ -753,6 +829,10 @@ export default function AuctionApp() {
   };
 
   const loadCatalog = useCallback(async (q: string, cat: string, pg: number) => {
+    const seq = ++catalogSeq.current;
+    catalogAbort.current?.abort();
+    const abort = new AbortController();
+    catalogAbort.current = abort;
     setCatalogLoading(true);
     // Долгий холодный старт Neon — даём запас; при пустом ответе на первой попытке повторяем.
     const fetchOnce = async () => {
@@ -760,32 +840,42 @@ export default function AuctionApp() {
       return fetchJson<{ success: boolean; items: Item[]; total: number; needsSync?: boolean; categories: { category: string; count: number }[] }>(
         `/api/items?q=${encodeURIComponent(q)}&category=${encodeURIComponent(cat)}&limit=${catalogPerPage}&offset=${off}`,
         undefined,
-        45000
+        45000,
+        abort.signal,
       );
     };
     try {
       let d = await fetchOnce();
       // Если предметы почему-то пришли пустыми, а всего их много — повтор один раз
-      if ((!d.items || d.items.length === 0) && (d.total || 0) > 0 && !q) {
+      if ((!d.items || d.items.length === 0) && (d.total || 0) > 0 && !q && !abort.signal.aborted) {
         d = await fetchOnce();
       }
+      if (catalogSeq.current !== seq || abort.signal.aborted) return;
       setCatalogItems(d.items || []);
       setCatalogTotal(d.total || 0);
       setCatalogNeedsSync(!!d.needsSync && (d.total || 0) === 0);
       if (d.categories?.length) setCategories(d.categories);
     } catch {
-      setCatalogItems([]);
+      if (catalogSeq.current === seq && !abort.signal.aborted) setCatalogItems([]);
     } finally {
-      setCatalogLoading(false);
+      if (catalogSeq.current === seq) setCatalogLoading(false);
     }
   }, []);
 
-  // Первичная загрузка
+  // Смена предмета/региона: мгновенно сбрасываем старые данные,
+  // чтобы не показывать цены предыдущего предмета, и грузим новые.
+  // Тихие автообновления (silent) экран при этом не трогают.
   useEffect(() => {
     if (selectedItem?.id && region) {
       setPage(1);
       setHistoryPage(1);
+      setLots([]);
+      setLotsTotal(0);
+      setHistory([]);
       setHistoryLoaded(false);
+      setApiError(null);
+      setLotsLoading(true);
+      setHistoryLoading(true);
       fetchLots(selectedItem.id, region);
       fetchHistory(selectedItem.id, region);
     }
@@ -795,6 +885,7 @@ export default function AuctionApp() {
   useEffect(() => {
     loadSession();
     loadTrackers();
+    loadSellTrackers();
     loadNotifications();
     loadCatalog("", "all", 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -855,16 +946,22 @@ export default function AuctionApp() {
   // ---------- Поиск ----------
   const doSearch = useCallback(async (q: string) => {
     const seq = ++searchSeq.current;
+    searchAbort.current?.abort();
+    const abort = new AbortController();
+    searchAbort.current = abort;
     setSearchLoading(true);
     try {
       const d = await fetchJson<{ success: boolean; items: Item[]; total: number }>(
-        `/api/items?q=${encodeURIComponent(q)}&limit=12`
+        `/api/items?q=${encodeURIComponent(q)}&limit=12`,
+        undefined,
+        15000,
+        abort.signal,
       );
-      if (searchSeq.current !== seq) return; // пришёл более свежий запрос — этот выбрасываем
+      if (searchSeq.current !== seq || abort.signal.aborted) return; // пришёл более свежий запрос — этот выбрасываем
       setSearchResults(d.items || []);
       setSearchTotal(d.total || 0);
     } catch {
-      if (searchSeq.current === seq) setSearchResults([]);
+      if (searchSeq.current === seq && !abort.signal.aborted) setSearchResults([]);
     } finally {
       if (searchSeq.current === seq) setSearchLoading(false);
     }
@@ -875,15 +972,26 @@ export default function AuctionApp() {
     setShowDropdown(true);
     setActiveIdx(-1);
     if (searchTimer.current) clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => doSearch(v), 250);
+    searchTimer.current = setTimeout(() => doSearch(v), 180);
   };
 
   const selectItem = (item: Item) => {
+    // Мгновенно отменяем все висящие запросы прошлого предмета
+    lotsAbort.current?.abort();
+    histAbort.current?.abort();
+    searchAbort.current?.abort();
+    catalogAbort.current?.abort();
+    lotsGen.current++;
+    histGen.current++;
+    searchSeq.current++;
+    catalogSeq.current++;
     setSelectedItem(item);
     setSearchQuery(itemName(item));
     setShowDropdown(false);
     setFilterUpgrade(null);
     setFilterQuality(null);
+    setHistoryFilterUpgrade(null);
+    setHistoryFilterQuality(null);
     setMaxPriceFilter("");
     setPage(1);
     setHistoryPage(1);
@@ -982,6 +1090,72 @@ export default function AuctionApp() {
       loadTrackers();
     } catch { /* ignore */ }
   };
+
+  const loadSellTrackers = useCallback(async () => {
+    try {
+      const d = await fetchJson<{ success: boolean; sellTrackers: SellTracker[] }>("/api/sell-trackers");
+      setSellTrackers(d.sellTrackers || []);
+    } catch { /* ignore */ }
+  }, []);
+
+  const openSellModal = useCallback((lot: Lot) => {
+    setSellLot(lot);
+    setSellDurationH(guessDurationH(lot));
+  }, []);
+
+  const saveSellTracker = useCallback(async () => {
+    if (!selectedItem || !sellLot) return;
+    setSellBusy(true);
+    try {
+      const d = await fetchJson<{ success: boolean; sellTracker?: SellTracker; duplicate?: boolean; confirmed?: boolean; tgSent?: boolean; message?: string }>(
+        "/api/sell-trackers",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            itemId: selectedItem.id,
+            itemName: itemName(selectedItem),
+            itemIcon: itemIcon(selectedItem),
+            region,
+            lotId: sellLot.id,
+            price: sellLot.buyoutPrice || sellLot.startPrice,
+            amount: sellLot.amount || 1,
+            upgrade: sellLot.upgrade,
+            quality: sellLot.quality,
+            qualityName: sellLot.qualityName,
+            endTime: sellLot.endTime,
+            durationH: sellDurationH,
+          }),
+        },
+        30000,
+      );
+      if (!d.success) {
+        pushToast("Не удалось", d.message || "Проверьте лот и попробуйте ещё раз.");
+        return;
+      }
+      setSellLot(null);
+      loadSellTrackers();
+      loadNotifications();
+      if (d.duplicate) {
+        pushToast("Уже отслеживается", "Этот лот уже привязан к продаже.");
+      } else if (d.tgSent) {
+        pushToast("Продажа под наблюдением", `${itemName(selectedItem)} — сообщу в Telegram, когда продастся.`);
+      } else {
+        pushToast("Продажа под наблюдением", "Привяжите Telegram, чтобы получать уведомления.");
+      }
+    } catch {
+      pushToast("Ошибка", "Не удалось привязать продажу.");
+    } finally {
+      setSellBusy(false);
+    }
+  }, [selectedItem, sellLot, sellDurationH, region, loadSellTrackers, loadNotifications, pushToast]);
+
+  const deleteSellTracker = useCallback(async (id: number) => {
+    try {
+      await fetch(`/api/sell-trackers/${id}`, { method: "DELETE" });
+      loadSellTrackers();
+    } catch { /* ignore */ }
+  }, [loadSellTrackers]);
 
   const toggleTracker = async (t: Tracker) => {
     try {
@@ -1618,7 +1792,14 @@ export default function AuctionApp() {
                           </span>
                         </div>
                         <div className="flex items-center gap-1.5 text-[12px] text-zinc-400">
-                          <Clock className="h-3.5 w-3.5 text-zinc-600" /> {getTimeLeft(lot.endTime)}
+                          <Clock className="h-3.5 w-3.5 shrink-0 text-zinc-600" /> {getTimeLeft(lot.endTime)}
+                          <button
+                            onClick={() => openSellModal(lot)}
+                            title="Отслеживать продажу этого лота"
+                            className="ml-auto rounded-lg border border-zinc-800 bg-zinc-900/60 p-1.5 text-zinc-500 transition hover:border-[#34d399]/50 hover:text-[#34d399]"
+                          >
+                            <Crosshair className="h-3.5 w-3.5" />
+                          </button>
                         </div>
                       </div>
                     ))}
@@ -1932,7 +2113,23 @@ export default function AuctionApp() {
               </div>
             </div>
 
-            {trackers.length === 0 ? (
+            <div className="mt-4 flex gap-1 rounded-xl border border-zinc-800 bg-[#101013] p-1">
+              <button
+                onClick={() => setTrackerTab("buy")}
+                className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg px-4 py-2 text-[13px] font-semibold transition ${trackerTab === "buy" ? "bg-zinc-800 text-white" : "text-zinc-500 hover:text-zinc-300"}`}
+              >
+                <Crosshair className="h-3.5 w-3.5" /> Покупаю ({trackers.length})
+              </button>
+              <button
+                onClick={() => { setTrackerTab("sell"); loadSellTrackers(); }}
+                className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg px-4 py-2 text-[13px] font-semibold transition ${trackerTab === "sell" ? "bg-zinc-800 text-white" : "text-zinc-500 hover:text-zinc-300"}`}
+              >
+                <ShoppingBag className="h-3.5 w-3.5" /> Продаю ({sellTrackers.filter((s) => s.status === "active").length})
+              </button>
+            </div>
+
+            {trackerTab === "buy" ? (
+            trackers.length === 0 ? (
               <div className="mt-4 rounded-2xl border border-dashed border-zinc-800 bg-[#101013] p-12 text-center">
                 <Crosshair className="mx-auto h-10 w-10 text-zinc-700" />
                 <p className="mt-3 text-[15px] font-semibold text-white">Пока нет ни одного трекера</p>
@@ -2023,6 +2220,93 @@ export default function AuctionApp() {
                   </div>
                 ))}
               </div>
+            )
+            ) : (
+              /* ===== Вкладка «Продаю» ===== */
+              sellTrackers.length === 0 ? (
+                <div className="mt-4 rounded-2xl border border-dashed border-zinc-800 bg-[#101013] p-12 text-center">
+                  <ShoppingBag className="mx-auto h-10 w-10 text-zinc-700" />
+                  <p className="mt-3 text-[15px] font-semibold text-white">Нет привязанных продаж</p>
+                  <p className="mx-auto mt-1 max-w-md text-[13px] text-zinc-500">
+                    Выставьте предмет в игре, откройте его лоты на сайте и нажмите прицел
+                    справа от вашего лота. Сообщу в Telegram, когда он продастся или истечёт срок.
+                  </p>
+                  <button onClick={() => setView("catalog")} className="mt-4 rounded-xl bg-[#34d399] px-5 py-2.5 text-[13px] font-bold text-black">
+                    Найти предмет
+                  </button>
+                </div>
+              ) : (
+                <div className="mt-4 grid gap-3 md:grid-cols-2">
+                  {[...sellTrackers].sort((a, b) => (a.status === "active" ? -1 : 1) - (b.status === "active" ? -1 : 1)).map((s) => (
+                    <div key={s.id} className={`rounded-2xl border p-4 transition ${s.status === "active" ? "border-zinc-800 bg-[#101013]" : "border-zinc-800/60 bg-[#0c0c0e] opacity-80"}`}>
+                      <div className="flex items-start gap-3">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={s.itemIcon || FALLBACK_ICON}
+                          alt=""
+                          onError={(e) => { (e.target as HTMLImageElement).src = FALLBACK_ICON; }}
+                          className="h-11 w-11 rounded-xl border border-zinc-800 bg-zinc-900 object-contain p-1"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <button
+                            onClick={() => {
+                              fetchJson<{ success: boolean; item: Item }>(`/api/items/${s.itemId}`)
+                                .then((d) => { if (d.success) selectItem(d.item); })
+                                .catch(() => selectItem({ id: s.itemId, nameRu: s.itemName, iconUrl: s.itemIcon || undefined }));
+                            }}
+                            className="flex items-center gap-1 truncate text-[14px] font-semibold text-white hover:text-[#34d399]"
+                          >
+                            {s.itemName} <ExternalLink className="h-3 w-3 shrink-0" />
+                          </button>
+                          <div className="mt-1 flex flex-wrap gap-1.5 text-[11px]">
+                            <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300">{s.region}</span>
+                            <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300">
+                              {s.qualityName || QUALITY_NAMES[s.quality]}{s.upgrade > 0 ? ` · +${s.upgrade}` : ""}
+                            </span>
+                            <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300">
+                              {formatPrice(s.price)} ₽{s.amount > 1 ? ` × ${s.amount}` : ""}
+                            </span>
+                          </div>
+                          <div className="mt-1.5">
+                            {s.status === "active" ? (
+                              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-300">
+                                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 live-dot" />
+                                На продаже{s.expectedEndTime ? ` · до ${formatDate(s.expectedEndTime)}` : ""}
+                              </span>
+                            ) : s.status === "sold" ? (
+                              <span className="inline-flex items-center gap-1.5 rounded-full border border-[#34d399]/30 bg-[#34d399]/10 px-2.5 py-0.5 text-[11px] font-semibold text-[#34d399]">
+                                <Check className="h-3 w-3" /> Продан{s.finishedAt ? ` · ${formatDate(s.finishedAt)}` : ""}
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-semibold text-amber-300">
+                                <Clock className="h-3 w-3" /> Срок истёк{s.finishedAt ? ` · ${formatDate(s.finishedAt)}` : ""}
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
+                            <Send className="h-3 w-3 shrink-0 text-sky-500" />
+                            {myTg?.linked ? (
+                              <span>Уведомления придут в ваш Telegram</span>
+                            ) : (
+                              <button onClick={() => setView("telegram")} className="text-sky-400 hover:underline">
+                                Привязать Telegram →
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex items-center gap-2 border-t border-zinc-800/60 pt-3">
+                        <button
+                          onClick={() => deleteSellTracker(s.id)}
+                          className="flex flex-1 items-center justify-center gap-1 rounded-lg bg-red-500/10 px-3 py-1.5 text-[12.5px] font-medium text-red-400 hover:bg-red-500/20"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" /> {s.status === "active" ? "Снять наблюдение" : "Убрать"}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )
             )}
           </div>
         )}
@@ -2678,6 +2962,81 @@ export default function AuctionApp() {
                 Запустить слежку
               </button>
               <button onClick={() => setShowTrackerModal(false)} className="rounded-xl bg-zinc-800 px-5 py-2.5 text-[13.5px] font-medium text-zinc-300 hover:bg-zinc-700">
+                Отмена
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===== Модалка привязки продажи ===== */}
+      {sellLot && selectedItem && (
+        <div className="fixed inset-0 z-[100] grid place-items-center bg-black/70 p-4 backdrop-blur-sm" onClick={() => setSellLot(null)}>
+          <div
+            className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#121214] p-5 shadow-2xl anim-fade-up"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={itemIcon(selectedItem)} alt="" onError={(e) => { (e.target as HTMLImageElement).src = FALLBACK_ICON; }} className="h-10 w-10 rounded-lg border border-zinc-800 bg-zinc-900 object-contain p-1" />
+                <div>
+                  <h2 className="text-[15px] font-bold text-white">💰 Отслеживать продажу</h2>
+                  <p className="max-w-[240px] truncate text-[12px] text-zinc-500">{itemName(selectedItem)} · {region}</p>
+                </div>
+              </div>
+              <button onClick={() => setSellLot(null)} className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-white">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 text-[12.5px]">
+              <div className="flex items-center justify-between">
+                <span className="text-zinc-500">Ваш лот</span>
+                <span className="mono text-[14px] font-bold text-white">
+                  {formatPrice(sellLot.buyoutPrice || sellLot.startPrice)} ₽{sellLot.amount > 1 ? ` × ${sellLot.amount}` : ""}
+                </span>
+              </div>
+              <div className="mt-1.5 flex items-center justify-between text-zinc-400">
+                <span>{sellLot.qualityName}{sellLot.upgrade > 0 ? ` · +${sellLot.upgrade}` : ""}</span>
+                <span className="flex items-center gap-1 text-[12px]">
+                  <Clock className="h-3.5 w-3.5 text-zinc-600" />
+                  {sellLot.endTime ? `до ${formatDate(sellLot.endTime)}` : "срок неизвестен"}
+                </span>
+              </div>
+            </div>
+
+            <div className="mt-3">
+              <label className="mb-1 block text-[12px] font-medium text-zinc-400">
+                На сколько выставляли в игре?
+              </label>
+              <div className="grid grid-cols-4 gap-1 rounded-xl border border-zinc-800 bg-zinc-900/50 p-1">
+                {SELL_DURATIONS.map((d) => (
+                  <button
+                    key={d}
+                    onClick={() => setSellDurationH(d)}
+                    className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${sellDurationH === d ? "bg-[#34d399] text-black" : "text-zinc-400 hover:text-white"}`}
+                  >
+                    {d} ч
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <p className="mt-3 rounded-xl bg-zinc-900/60 px-3 py-2 text-[11.5px] leading-relaxed text-zinc-500">
+              💡 Привяжу именно этот лот. В Telegram сразу придёт подтверждение,
+              а потом — «продано» или «срок истёк». Сайт можно закрыть.
+            </p>
+
+            <div className="mt-4 flex gap-2">
+              <button
+                onClick={saveSellTracker}
+                disabled={sellBusy}
+                className="flex-1 rounded-xl bg-[#34d399] py-2.5 text-[13.5px] font-bold text-black hover:brightness-110 disabled:opacity-50"
+              >
+                {sellBusy ? "Привязываю…" : "Привязать продажу"}
+              </button>
+              <button onClick={() => setSellLot(null)} className="rounded-xl bg-zinc-800 px-5 py-2.5 text-[13.5px] font-medium text-zinc-300 hover:bg-zinc-700">
                 Отмена
               </button>
             </div>

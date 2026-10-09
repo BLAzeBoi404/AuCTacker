@@ -1,36 +1,37 @@
 import { NextRequest, NextResponse } from "next/server";
-import { ExboApiError, fetchLots, normalizeRegion } from "@/lib/exbo";
+import { ExboApiError, fetchLotsAll, normalizeRegion } from "@/lib/exbo";
 import { QUALITY_NAMES } from "@/lib/constants";
 
 export const dynamic = "force-dynamic";
+
+// Короткий кэш «горячих» предметов: повторные открытия и автообновление
+// нескольких друзей не дёргают EXBO по кругу. Трекинг продаж и покупок
+// идёт мимо кэша — ему всегда нужны свежие данные.
+const LOTS_TTL_MS = 25_000;
+interface LotsCacheEntry {
+  exp: number;
+  payload: unknown;
+}
+const lotsCache = new Map<string, LotsCacheEntry>();
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const itemId = (searchParams.get("itemId") || "").trim();
   const region = normalizeRegion(searchParams.get("region"));
   const limit = Math.min(500, Math.max(1, Number(searchParams.get("limit") || 200)));
-  const offset = Math.max(0, Number(searchParams.get("offset") || 0));
 
   if (!itemId) {
     return NextResponse.json({ success: false, lots: [], total: 0, error: "itemId_required" });
   }
 
+  const cacheKey = `${itemId.toLowerCase()}|${region}|${limit}`;
+  const cached = lotsCache.get(cacheKey);
+  if (cached && Date.now() < cached.exp) {
+    return NextResponse.json({ ...(cached.payload as Record<string, unknown>), cached: true });
+  }
+
   try {
-    // Подгружаем до 1000 лотов постранично (API отдаёт максимум 100 за раз)
-    const pageSize = 100;
-    let all: Awaited<ReturnType<typeof fetchLots>>["lots"] = [];
-    let total = 0;
-    const need = Math.min(limit, 1000);
-    for (let off = offset; off < offset + need; off += pageSize) {
-      const chunkLimit = Math.min(pageSize, offset + need - off);
-      const r = await fetchLots(itemId, region, chunkLimit, off);
-      total = r.total;
-      if (r.lots.length === 0) break;
-      all = all.concat(r.lots);
-      if (r.lots.length < chunkLimit) break;
-      if (all.length >= need) break;
-    }
-    all = all.slice(0, need);
+    const { lots: all, total } = await fetchLotsAll(itemId, region, limit);
 
     const lots = all.map((l) => ({
       ...l,
@@ -50,7 +51,7 @@ export async function GET(req: NextRequest) {
           }
         : { min: 0, max: 0, avg: 0, count: lots.length };
 
-    return NextResponse.json({
+    const payload = {
       success: true,
       lots,
       total,
@@ -58,7 +59,13 @@ export async function GET(req: NextRequest) {
       region,
       source: "EXBO EAPI",
       fetchedAt: new Date().toISOString(),
-    });
+    };
+    lotsCache.set(cacheKey, { exp: Date.now() + LOTS_TTL_MS, payload });
+    if (lotsCache.size > 200) {
+      const first = lotsCache.keys().next().value;
+      if (first) lotsCache.delete(first);
+    }
+    return NextResponse.json(payload);
   } catch (e) {
     const message = e instanceof ExboApiError ? e.message : "Не удалось загрузить официальный аукцион EXBO";
     const status = e instanceof ExboApiError ? e.status : 502;

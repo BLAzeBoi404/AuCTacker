@@ -30,6 +30,7 @@ async function tick() {
       lastSummary =
         `трекеров: ${r.checked}, лотов EXBO: ${r.apiLots}, подходит: ${r.totalMatches}, `
         + `новых: ${r.matches.length}, TG: ${r.telegramSent}, ошибок: ${r.failed}, `
+        + `продажи: ${r.sellChecked}/${r.sellSold}/${r.sellExpired}, `
         + `база: ${r.dbTouched ? "запрос" : "спит"}`;
     } catch (e) {
       lastRun = new Date();

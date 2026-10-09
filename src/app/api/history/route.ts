@@ -1,8 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
-import { ExboApiError, fetchHistory, normalizeRegion } from "@/lib/exbo";
+import { ExboApiError, fetchHistoryAll, normalizeRegion } from "@/lib/exbo";
 import { QUALITY_NAMES } from "@/lib/constants";
 
 export const dynamic = "force-dynamic";
+
+// История меняется медленнее лотов — кэш на минуту.
+const HIST_TTL_MS = 60_000;
+interface HistCacheEntry {
+  exp: number;
+  payload: unknown;
+}
+const histCache = new Map<string, HistCacheEntry>();
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -14,25 +22,14 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ success: false, history: [], total: 0, error: "itemId_required" });
   }
 
-  try {
-    const pageSize = 100;
-    let all: Awaited<ReturnType<typeof fetchHistory>>["history"] = [];
-    let total = 0;
-    for (let off = 0; off < limit; off += pageSize) {
-      const chunkLimit = Math.min(pageSize, limit - off);
-      const r = await fetchHistory(itemId, region, chunkLimit, off);
-      total = r.total;
-      if (r.history.length === 0) break;
-      all = all.concat(r.history);
-      if (r.history.length < chunkLimit) break;
-    }
+  const cacheKey = `${itemId.toLowerCase()}|${region}|${limit}`;
+  const cached = histCache.get(cacheKey);
+  if (cached && Date.now() < cached.exp) {
+    return NextResponse.json({ ...(cached.payload as Record<string, unknown>), cached: true });
+  }
 
-    // Сортируем по времени (новые сверху) — API иногда отдаёт вперемешку
-    all.sort((a, b) => {
-      const ta = a.time ? new Date(a.time).getTime() : 0;
-      const tb = b.time ? new Date(b.time).getTime() : 0;
-      return tb - ta;
-    });
+  try {
+    const { history: all, total } = await fetchHistoryAll(itemId, region, limit);
 
     const history = all.map((h, i) => ({
       ...h,
@@ -52,7 +49,21 @@ export async function GET(req: NextRequest) {
           }
         : { last: 0, min: 0, max: 0, avg: 0, count: history.length };
 
-    return NextResponse.json({ success: true, history, total, stats, region, source: "EXBO EAPI", fetchedAt: new Date().toISOString() });
+    const payload = {
+      success: true,
+      history,
+      total,
+      stats,
+      region,
+      source: "EXBO EAPI",
+      fetchedAt: new Date().toISOString(),
+    };
+    histCache.set(cacheKey, { exp: Date.now() + HIST_TTL_MS, payload });
+    if (histCache.size > 200) {
+      const first = histCache.keys().next().value;
+      if (first) histCache.delete(first);
+    }
+    return NextResponse.json({ success: true, history, total, stats, region, source: "EXBO EAPI", fetchedAt: payload.fetchedAt });
   } catch (e) {
     const message = e instanceof ExboApiError ? e.message : "Не удалось загрузить историю EXBO";
     const status = e instanceof ExboApiError ? e.status : 502;
