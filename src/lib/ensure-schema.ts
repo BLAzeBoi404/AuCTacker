@@ -209,6 +209,9 @@ export async function ensureSchema(): Promise<void> {
     await db.execute(sql`
       ALTER TABLE notifications ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'buy';
     `);
+    await db.execute(sql`
+      ALTER TABLE sell_trackers ADD COLUMN IF NOT EXISTS quality_mode text NOT NULL DEFAULT 'exact';
+    `);
     done = true;
   })().catch((e) => {
     running = null;

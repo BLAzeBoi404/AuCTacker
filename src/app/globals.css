@@ -150,3 +150,59 @@ button {
 button:disabled {
   cursor: not-allowed;
 }
+
+/* ===== Оптимизация под телефоны ===== */
+@media(max-width:800px){
+  .metric{padding:11px}
+  .metric>strong{font-size:16px;margin-top:9px}
+  .chart-panel{padding:12px}
+  .table-tabs{gap:14px}
+  .table-tabs button{font-size:11.5px}
+  /* Лоты и история: на телефоне колонки перестраиваются в 2 строки,
+     где цена+заточка сверху, редкость+время снизу */
+  .tracking-summary>div,.tracking-summary>a{min-width:0}
+  .tracker-card{padding:13px}
+  .tracker-conditions{gap:5px;margin:16px 0 11px}
+  .tracker-conditions>span{font-size:9.5px;padding:4px 6px}
+  /* Каталог: карточки компактнее, чтобы влезало 2 в ряд на узких экранах */
+  .item-card{min-height:180px}
+  .item-card h3{font-size:11.5px}
+  /* Фильтры истории и лотов — прокручиваются вбок, не ломая сетку */
+  .catalog-tools{flex-wrap:nowrap}
+  .catalog-tools>select{min-width:118px;font-size:11px;padding-left:6px;padding-right:22px}
+  .segmented{max-width:100%;overflow-x:auto}
+}
+@media(max-width:540px){
+  /* Строки таблиц: цена занимает всю ширину первой строки */
+  td{padding:10px 12px}
+  th{padding:10px 12px;font-size:7.5px;letter-spacing:.6px}
+  .data-panel{border-radius:10px}
+  .pagination{font-size:10.5px;gap:7px}
+  .page-buttons button{min-width:28px;height:28px}
+  /* Итог по фильтру: карточки в 2 колонки, а не в столбик */
+  .sell-summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+  .tracker-actions{gap:6px}
+  .tracker-actions .secondary-btn{font-size:10.5px;padding:6px 8px}
+  /* Панель фильтров — компактнее */
+  .lots-sort{gap:8px;font-size:10px}
+  .lots-sort select{font-size:10px}
+  /* Навигация: активный пункт подсвечен, остальное скроллится */
+  .main-nav a{font-size:12px;padding:6px 8px}
+  .brand>span:last-child{font-size:16px}
+  /* Поиск: кнопка Открыть не наезжает на текст */
+  .search-field input{font-size:12.5px}
+  .region-control>select{min-width:66px;font-size:10.5px}
+  .telegram-nav{font-size:0;gap:0;padding:8px}
+  .telegram-nav svg{width:18px;height:18px}
+  .topbar{height:60px}
+  .topbar-inner{height:60px}
+  .mobile-nav{top:59px}
+  .main-content{padding-left:12px;padding-right:12px}
+  .empty-state{padding:22px 16px;min-height:200px}
+  .empty-symbol{width:48px;height:48px;margin-bottom:14px}
+}
+@media(max-width:380px){
+  .item-grid{grid-template-columns:1fr}
+  .metrics-grid{grid-template-columns:1fr 1fr}
+  .tracking-summary{grid-template-columns:1fr}
+}

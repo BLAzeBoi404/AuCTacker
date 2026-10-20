@@ -281,11 +281,29 @@ async function deliverPending(chats: ChatRow[], siteUrl: string): Promise<number
 /** Отпечаток лота продажи для поиска среди активных лотов */
 function sellLotMatches(
   lot: NormalizedLot,
-  s: { targetLotId: string | null; price: number; amount: number; upgrade: number; quality: number; expectedEndTime: Date | null },
+  s: {
+    targetLotId: string | null;
+    price: number;
+    amount: number;
+    upgrade: number;
+    quality: number;
+    qualityMode: string;
+    expectedEndTime: Date | null;
+  },
 ): boolean {
   if (s.targetLotId && lot.id === s.targetLotId) return true;
   const price = lot.buyoutPrice || lot.startPrice || 0;
-  if (price !== s.price || lot.amount !== s.amount || lot.upgrade !== s.upgrade || lot.quality !== s.quality) {
+  // Заточка и количество — строго как у лота пользователя.
+  // Редкость: "exact" — только совпадение, "min" — выбранная и выше
+  // (например, выбрал «Редкий» → прислали и «Исключительный», и «Легендарный»).
+  const qualityOk =
+    s.qualityMode === "min" ? lot.quality >= s.quality : lot.quality === s.quality;
+  if (
+    price !== s.price ||
+    lot.amount !== s.amount ||
+    lot.upgrade !== s.upgrade ||
+    !qualityOk
+  ) {
     return false;
   }
   if (s.expectedEndTime && lot.endTime) {
@@ -322,15 +340,64 @@ async function check(source: string): Promise<CheckResult> {
 
   if (!current.schedulerEnabled && source === "scheduler") return result;
 
-  const enabled = current.trackers.filter((tracker) => tracker.enabled);
-  const activeSell = current.sellTrackers.filter((s) => s.status === "active");
-  if (!enabled.length && !activeSell.length) return result;
-
   const chatsByOwner = new Map<string, ChatRow[]>();
   for (const chat of current.chats) {
     if (!chat.ownerKey) continue;
     chatsByOwner.set(chat.ownerKey, [...(chatsByOwner.get(chat.ownerKey) || []), chat]);
   }
+
+  const now = Date.now();
+
+  // 0. Зависшие продажи: если «лот уже должен был закончиться», но мы всё ещё
+  // не видим ни лота, ни признаков продажи — закрываем как истёкший.
+  // Без этого забытый лот висел в «Продаю» бесконечно, пока его не удалишь.
+  for (const sell of current.sellTrackers.filter((s) => s.status === "active")) {
+    const endTs = sell.expectedEndTime ? new Date(sell.expectedEndTime).getTime() : null;
+    if (endTs === null) continue;
+    const grace = 15 * 60_000; // ждём лаг EAPI + 2 промаха подряд
+    if (now < endTs + grace) continue;
+    const misses = (sell.missCount ?? 0) + 1;
+    await db.update(sellTrackers).set({
+      status: "expired",
+      finishedAt: new Date(endTs),
+      finishPrice: sell.price,
+      missCount: misses,
+    }).where(eq(sellTrackers.id, sell.id));
+    sell.status = "expired";
+    sell.finishedAt = new Date(endTs);
+    sell.missCount = misses;
+    result.sellExpired++;
+    result.dbTouched = true;
+    invalidateAll();
+    try {
+      const targets = sell.ownerKey ? (chatsByOwner.get(sell.ownerKey) || []) : [];
+      const qn = sell.qualityName || QUALITY_NAMES[sell.quality ?? 0] || "Обычный";
+      await db.insert(notifications).values({
+        kind: "sell_expired",
+        ownerKey: sell.ownerKey,
+        itemId: sell.itemId,
+        itemName: sell.itemName,
+        itemIcon: sell.itemIcon,
+        region: sell.region,
+        lotId: sell.targetLotId,
+        price: sell.price,
+        upgrade: sell.upgrade ?? 0,
+        quality: sell.quality ?? 0,
+        qualityName: qn,
+        message: `Срок истёк, лот пропал из аукциона`,
+        targetChatIds: targets.map((c) => c.chatId),
+        sentChatIds: [],
+        retryAt: new Date(),
+      }).onConflictDoNothing();
+      hasPendingDeliveries = true;
+    } catch {
+      /* уведомление вторично — статус уже сохранён */
+    }
+  }
+
+  const enabled = current.trackers.filter((tracker) => tracker.enabled);
+  const activeSell = current.sellTrackers.filter((s) => s.status === "active");
+  if (!enabled.length && !activeSell.length) return result;
 
   // Снимки аукциона кэшируем в пределах одного цикла: один предмет+регион —
   // один набор запросов к EXBO, сколько бы трекеров (покупки + продажи) его ни смотрели
@@ -541,6 +608,7 @@ async function check(source: string): Promise<CheckResult> {
           amount: sell.amount ?? 1,
           upgrade: sell.upgrade ?? 0,
           quality: sell.quality ?? 0,
+          qualityMode: sell.qualityMode ?? "exact",
           expectedEndTime: expectedEnd,
         }),
       );
@@ -565,10 +633,14 @@ async function check(source: string): Promise<CheckResult> {
       const endTs = expectedEnd ? expectedEnd.getTime() : null;
       const expiredByTime = endTs !== null && now.getTime() >= endTs - 5 * 60_000;
 
-      // Ищем подтверждение продажи в истории: та же цена/заточка/редкость после привязки
+      // Ищем подтверждение продажи в истории. ВАЖНО: раньше сверялись только цена,
+      // заточка и редкость — из-за чего обычный предмет, проданный по цене
+      // исключительного, засчитывался как продажа исключительного. Теперь
+      // сверяем ВСЕ атрибуты, а историю берём параллельными пачками сразу
+      // на 200 записей, чтобы совпадение не потерялось глубже первой сотни.
       let soldAt: Date | null = null;
       try {
-        const hist = await fetchHistoryAll(sell.itemId, sell.region, 100);
+        const hist = await fetchHistoryAll(sell.itemId, sell.region, 200);
         const since = (sell.createdAt ? new Date(sell.createdAt).getTime() : 0) - 10 * 60_000;
         const hit = hist.history.find(
           (h) =>
@@ -583,7 +655,9 @@ async function check(source: string): Promise<CheckResult> {
         // историю не получили — решаем по сроку
       }
 
-      const sold = soldAt !== null || !expiredByTime;
+      // Если время уже вышло и истории о продаже нет — это точно истечение,
+      // а не продажа. Раньше "продан по умолчанию" давал ложные срабатывания.
+      const sold = soldAt !== null && !expiredByTime;
       const status = sold ? "sold" : "expired";
       const finishedAt = soldAt ?? now;
       if (sold) result.sellSold++;

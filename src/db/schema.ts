@@ -65,6 +65,7 @@ export const sellTrackers = pgTable("sell_trackers", {
   amount: integer("amount").notNull().default(1),
   upgrade: integer("upgrade").notNull().default(0),
   quality: integer("quality").notNull().default(0),
+  qualityMode: text("quality_mode").notNull().default("exact"), // exact | min
   qualityName: text("quality_name"),
   targetLotId: text("target_lot_id"),
   startTime: timestamp("start_time"),

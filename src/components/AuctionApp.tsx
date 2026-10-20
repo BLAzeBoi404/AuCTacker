@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Search, Bell, BellRing, Plus, RefreshCw, Trash2, X, ChevronLeft,
+  Search, Bell, BellRing, RefreshCw, Trash2, X, ChevronLeft,
   ChevronRight, ChevronDown, Star, TrendingUp, TrendingDown, Minus,
   Package, Gavel, History as HistoryIcon, Settings2,
   Check, Eye, EyeOff, Zap, Shield, Crosshair, Clock, Database, Swords,
@@ -130,6 +130,12 @@ interface SettingsState {
   telegram_bot_username: string;
   cron_secret: string;
 }
+interface Toast {
+  id: number;
+  title: string;
+  message: string;
+  icon?: string | null;
+}
 interface Notif {
   id: number;
   trackerId: number | null;
@@ -166,29 +172,6 @@ interface SellTracker {
   finishPrice: number | null;
   missCount: number;
   createdAt: string;
-}
-
-const SELL_DURATIONS = [6, 12, 24, 48] as const;
-
-/** Длительность размещения по лоту: из разницы старт/конец, иначе 48 ч */
-function guessDurationH(lot: { startTime?: string | null; endTime?: string | null }): number {
-  try {
-    if (lot.startTime && lot.endTime) {
-      const h = Math.round((new Date(lot.endTime).getTime() - new Date(lot.startTime).getTime()) / 3_600_000);
-      let best: number = SELL_DURATIONS[SELL_DURATIONS.length - 1];
-      for (const d of SELL_DURATIONS) {
-        if (Math.abs(d - h) < Math.abs(best - h)) best = d;
-      }
-      return best;
-    }
-  } catch { /* ignore */ }
-  return 48;
-}
-interface Toast {
-  id: number;
-  title: string;
-  message: string;
-  icon?: string | null;
 }
 
 const itemName = (it: Item | null | undefined) =>
@@ -364,7 +347,7 @@ export default function AuctionApp() {
   const [sellTrackers, setSellTrackers] = useState<SellTracker[]>([]);
   const [trackerTab, setTrackerTab] = useState<"buy" | "sell">("buy");
   const [sellLot, setSellLot] = useState<Lot | null>(null);
-  const [sellDurationH, setSellDurationH] = useState<number>(48);
+  const [sellQualityMode, setSellQualityMode] = useState<"exact" | "min">("exact");
   const [sellBusy, setSellBusy] = useState(false);
 
   // ---------- Notifications ----------
@@ -1004,11 +987,27 @@ export default function AuctionApp() {
     } catch { /* ignore */ }
   };
 
+  // Enter: если подсвечен вариант — открываем его. Если нет — берём первый
+  // результат поиска. Это же работает и на телефоне: кнопка Enter на клавиатуре
+  // превращается в «поиск», и предмет открывается без отдельного тапа по списку.
   const onSearchKey = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const picked = activeIdx >= 0 ? searchResults[activeIdx] : searchResults[0];
+      if (picked) {
+        selectItem(picked);
+        return;
+      }
+      // Результатов ещё нет (дебаунс не отработал) — ищем сразу
+      if (searchQuery.trim()) {
+        setShowDropdown(false);
+        void doSearch(searchQuery.trim());
+      }
+      return;
+    }
     if (!showDropdown || searchResults.length === 0) return;
     if (e.key === "ArrowDown") { e.preventDefault(); setActiveIdx((i) => Math.min(i + 1, searchResults.length - 1)); }
     else if (e.key === "ArrowUp") { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); }
-    else if (e.key === "Enter" && activeIdx >= 0) { e.preventDefault(); selectItem(searchResults[activeIdx]); }
   };
 
   // ---------- Проверка трекеров ----------
@@ -1100,7 +1099,7 @@ export default function AuctionApp() {
 
   const openSellModal = useCallback((lot: Lot) => {
     setSellLot(lot);
-    setSellDurationH(guessDurationH(lot));
+    setSellQualityMode("exact");
   }, []);
 
   const saveSellTracker = useCallback(async () => {
@@ -1124,7 +1123,7 @@ export default function AuctionApp() {
             quality: sellLot.quality,
             qualityName: sellLot.qualityName,
             endTime: sellLot.endTime,
-            durationH: sellDurationH,
+            qualityMode: sellQualityMode,
           }),
         },
         30000,
@@ -1148,7 +1147,7 @@ export default function AuctionApp() {
     } finally {
       setSellBusy(false);
     }
-  }, [selectedItem, sellLot, sellDurationH, region, loadSellTrackers, loadNotifications, pushToast]);
+  }, [selectedItem, sellLot, sellQualityMode, region, loadSellTrackers, loadNotifications, pushToast]);
 
   const deleteSellTracker = useCallback(async (id: number) => {
     try {
@@ -1300,6 +1299,27 @@ export default function AuctionApp() {
   const paginatedLots = processedLots.slice((page - 1) * perPage, page * perPage);
   const totalHistoryPages = Math.max(1, Math.ceil(processedHistory.length / perPage));
   const paginatedHistory = processedHistory.slice((historyPage - 1) * perPage, historyPage * perPage);
+
+  // Перелистнул страницу → экран поднимается к началу списка,
+  // иначе пользователь оказывается внизу и думает, что данные не сменились.
+  const lotListTopRef = useRef<HTMLDivElement>(null);
+  const histListTopRef = useRef<HTMLDivElement>(null);
+  const scrollTopOf = (ref: React.RefObject<HTMLDivElement | null>) => {
+    const el = ref?.current;
+    if (!el) return;
+    const top = el.getBoundingClientRect().top + window.scrollY - 80; // запас под sticky-шапку
+    window.scrollTo({ top, behavior: "smooth" });
+  };
+  const gotoLotsPage = (next: number) => {
+    const changed = next !== page;
+    setPage(next);
+    if (changed) scrollTopOf(lotListTopRef);
+  };
+  const gotoHistoryPage = (next: number) => {
+    const changed = next !== historyPage;
+    setHistoryPage(next);
+    if (changed) scrollTopOf(histListTopRef);
+  };
   const catalogTotalPages = Math.max(1, Math.ceil(catalogTotal / catalogPerPage));
   const enabledTrackers = trackers.filter((t) => t.enabled);
 
@@ -1409,6 +1429,8 @@ export default function AuctionApp() {
             <Search className="h-4 w-4" />
           </div>
           <input
+            type="search"
+            enterKeyHint="search"
             value={searchQuery}
             onChange={(e) => onSearchInput(e.target.value)}
             onFocus={() => { setShowDropdown(true); if (searchResults.length === 0) doSearch(searchQuery); }}
@@ -1416,8 +1438,22 @@ export default function AuctionApp() {
             placeholder="Быстрый поиск предмета… (название, ID или категория)"
             className="w-full rounded-xl border border-zinc-800 bg-[#121214] py-3 pl-11 pr-12 text-[14px] text-white placeholder-zinc-500 outline-none transition focus:border-[#34d399]/60 focus:ring-2 focus:ring-[#34d399]/10"
           />
-          {searchLoading && (
+          {searchLoading ? (
             <div className="absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin rounded-full border-2 border-zinc-700 border-t-[#34d399]" />
+          ) : (
+            searchQuery.trim() && (
+              <button
+                onClick={() => {
+                  const picked = searchResults[0];
+                  if (picked) selectItem(picked);
+                  else { setShowDropdown(false); void doSearch(searchQuery.trim()); }
+                }}
+                title="Найти и открыть первый результат"
+                className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg bg-[#34d399] px-2.5 py-1 text-[11.5px] font-bold text-black"
+              >
+                Открыть
+              </button>
+            )
           )}
           {showDropdown && searchResults.length > 0 && (
             <ul className="absolute left-0 right-0 top-full z-50 mt-2 max-h-[340px] overflow-y-auto rounded-xl border border-zinc-800 bg-[#121214] shadow-2xl anim-fade-up">
@@ -1756,6 +1792,7 @@ export default function AuctionApp() {
             {/* ===== Таблицы ===== */}
             {activeTab === "lots" ? (
               <div className="mt-3 overflow-hidden rounded-2xl border border-zinc-800/80 bg-[#101013]">
+                <div ref={lotListTopRef} className="h-0" />
                 {lotsLoading ? (
                   <div className="space-y-2 p-4">
                     {[0, 1, 2, 3, 4].map((i) => <div key={i} className="skeleton h-12 rounded-lg" />)}
@@ -1808,7 +1845,7 @@ export default function AuctionApp() {
                       <div className="flex items-center justify-center gap-3 border-t border-zinc-800 px-4 py-3 text-[12.5px] text-zinc-400">
                         <button
                           disabled={page === 1}
-                          onClick={() => setPage((p) => Math.max(1, p - 1))}
+                          onClick={() => gotoLotsPage(Math.max(1, page - 1))}
                           className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                         >
                           <ChevronLeft className="h-3.5 w-3.5" /> Назад
@@ -1816,7 +1853,7 @@ export default function AuctionApp() {
                         <span>Страница {page} из {totalPages}</span>
                         <button
                           disabled={page === totalPages}
-                          onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                          onClick={() => gotoLotsPage(Math.min(totalPages, page + 1))}
                           className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                         >
                           Вперёд <ChevronRight className="h-3.5 w-3.5" />
@@ -1830,6 +1867,7 @@ export default function AuctionApp() {
               <div className="mt-3 grid grid-cols-1 gap-4 lg:grid-cols-[1fr_320px]">
                 {/* Левая колонка: Таблица истории */}
                 <div className="overflow-hidden rounded-2xl border border-zinc-800/80 bg-[#101013]">
+                  <div ref={histListTopRef} className="h-0" />
                   {historyLoading && !historyLoaded ? (
                     <div className="space-y-2 p-4">
                       {[0, 1, 2, 3, 4].map((i) => <div key={i} className="skeleton h-12 rounded-lg" />)}
@@ -1870,7 +1908,7 @@ export default function AuctionApp() {
                         <div className="flex items-center justify-center gap-3 border-t border-zinc-800 px-4 py-3 text-[12.5px] text-zinc-400">
                           <button
                             disabled={historyPage === 1}
-                            onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}
+                            onClick={() => gotoHistoryPage(Math.max(1, historyPage - 1))}
                             className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                           >
                             <ChevronLeft className="h-3.5 w-3.5" /> Назад
@@ -1878,7 +1916,7 @@ export default function AuctionApp() {
                           <span>Страница {historyPage} из {totalHistoryPages}</span>
                           <button
                             disabled={historyPage === totalHistoryPages}
-                            onClick={() => setHistoryPage((p) => Math.min(totalHistoryPages, p + 1))}
+                            onClick={() => gotoHistoryPage(Math.min(totalHistoryPages, historyPage + 1))}
                             className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                           >
                             Вперёд <ChevronRight className="h-3.5 w-3.5" />
@@ -1898,7 +1936,7 @@ export default function AuctionApp() {
                     Статистика за выбранный период при текущих параметрах заточки и редкости.
                   </div>
 
-                  <div className="mt-4 space-y-2">
+                  <div className="mt-4 space-y-2 sell-summary-grid">
                     <div className="rounded-xl border border-zinc-800/60 bg-zinc-900/30 px-3 py-2.5">
                       <div className="text-[11px] text-zinc-500 uppercase tracking-wider">Минимальная цена</div>
                       <div className="mono mt-1 text-[16px] font-bold text-[#34d399]">
@@ -2104,12 +2142,7 @@ export default function AuctionApp() {
                     {checking ? "Проверка…" : "Проверить сейчас"}
                   </button>
                 )}
-                <button
-                  onClick={() => setShowTrackerModal(true)}
-                  className="flex items-center gap-1.5 rounded-xl bg-[#34d399] px-4 py-2 text-[13px] font-bold text-black hover:brightness-110"
-                >
-                  <Plus className="h-4 w-4" /> Новый трекер
-                </button>
+
               </div>
             </div>
 
@@ -3008,24 +3041,27 @@ export default function AuctionApp() {
 
             <div className="mt-3">
               <label className="mb-1 block text-[12px] font-medium text-zinc-400">
-                На сколько выставляли в игре?
+                Редкость: сообщать о продажах
               </label>
-              <div className="grid grid-cols-4 gap-1 rounded-xl border border-zinc-800 bg-zinc-900/50 p-1">
-                {SELL_DURATIONS.map((d) => (
-                  <button
-                    key={d}
-                    onClick={() => setSellDurationH(d)}
-                    className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${sellDurationH === d ? "bg-[#34d399] text-black" : "text-zinc-400 hover:text-white"}`}
-                  >
-                    {d} ч
-                  </button>
-                ))}
+              <div className="grid grid-cols-2 gap-1 rounded-xl border border-zinc-800 bg-zinc-900/50 p-1">
+                <button
+                  onClick={() => setSellQualityMode("exact")}
+                  className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${sellQualityMode === "exact" ? "bg-[#34d399] text-black" : "text-zinc-400 hover:text-white"}`}
+                >
+                  Точно {sellLot.qualityName}
+                </button>
+                <button
+                  onClick={() => setSellQualityMode("min")}
+                  className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${sellQualityMode === "min" ? "bg-[#34d399] text-black" : "text-zinc-400 hover:text-white"}`}
+                >
+                  От {sellLot.qualityName} и выше
+                </button>
               </div>
             </div>
 
             <p className="mt-3 rounded-xl bg-zinc-900/60 px-3 py-2 text-[11.5px] leading-relaxed text-zinc-500">
-              💡 Привяжу именно этот лот. В Telegram сразу придёт подтверждение,
-              а потом — «продано» или «срок истёк». Сайт можно закрыть.
+              💡 Привяжу именно этот лот — срок окончания возьму из него сам.
+              В Telegram сразу придёт подтверждение, а потом — «продано» или «срок истёк». Сайт можно закрыть.
             </p>
 
             <div className="mt-4 flex gap-2">

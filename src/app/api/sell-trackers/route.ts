@@ -67,6 +67,7 @@ export async function POST(req: NextRequest) {
     const amount = Math.max(1, Math.min(999, Math.round(Number(body.amount) || 1)));
     const upgrade = Math.max(0, Math.min(30, Math.round(Number(body.upgrade) || 0)));
     const quality = [0, 1, 2, 3, 4, 5].includes(Number(body.quality)) ? Number(body.quality) : 0;
+    const qualityMode = body.qualityMode === "min" ? "min" : "exact";
     const lotId = typeof body.lotId === "string" && body.lotId ? body.lotId : null;
     const clientEnd = typeof body.endTime === "string" && body.endTime ? new Date(body.endTime) : null;
     const durationH = snapDuration(body.durationH ?? body.listedDurationH ?? 48);
@@ -149,6 +150,7 @@ export async function POST(req: NextRequest) {
         amount,
         upgrade,
         quality,
+        qualityMode,
         qualityName: typeof body.qualityName === "string" ? body.qualityName : null,
         targetLotId: lotId,
         startTime: foundStart,
