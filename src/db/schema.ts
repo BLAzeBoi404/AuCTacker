@@ -3,6 +3,7 @@ import {
   serial,
   text,
   integer,
+  bigint,
   boolean,
   timestamp,
   jsonb,
@@ -33,8 +34,9 @@ export const trackers = pgTable("trackers", {
   upgradeMode: text("upgrade_mode").notNull().default("exact"), // exact | min | any
   targetUpgrade: integer("target_upgrade").notNull().default(0),
   targetQuality: integer("target_quality").notNull().default(-1), // -1 = любая
-  maxPrice: integer("max_price").notNull().default(0), // 0 = любая
-  minPrice: integer("min_price").notNull().default(0),
+  qualityMode: text("quality_mode").notNull().default("exact"), // exact | min
+  maxPrice: bigint("max_price", { mode: "number" }).notNull().default(0), // 0 = любая
+  minPrice: bigint("min_price", { mode: "number" }).notNull().default(0),
   enabled: boolean("enabled").notNull().default(true),
   enableSound: boolean("enable_sound").notNull().default(true),
   enableBrowser: boolean("enable_browser").notNull().default(true),
@@ -61,7 +63,7 @@ export const sellTrackers = pgTable("sell_trackers", {
   itemName: text("item_name").notNull(),
   itemIcon: text("item_icon"),
   region: text("region").notNull().default("EU"),
-  price: integer("price").notNull().default(0),
+  price: bigint("price", { mode: "number" }).notNull().default(0),
   amount: integer("amount").notNull().default(1),
   upgrade: integer("upgrade").notNull().default(0),
   quality: integer("quality").notNull().default(0),
@@ -71,10 +73,13 @@ export const sellTrackers = pgTable("sell_trackers", {
   startTime: timestamp("start_time"),
   expectedEndTime: timestamp("expected_end_time"),
   listedDurationH: integer("listed_duration_h"),
-  status: text("status").notNull().default("active"), // active | sold | expired
+  status: text("status").notNull().default("active"), // active | sold | expired | removed
   lastSeenAt: timestamp("last_seen_at"),
+  firstMissingAt: timestamp("first_missing_at"),
+  lastCheckedAt: timestamp("last_checked_at"),
+  lastError: text("last_error"),
   finishedAt: timestamp("finished_at"),
-  finishPrice: integer("finish_price"),
+  finishPrice: bigint("finish_price", { mode: "number" }),
   missCount: integer("miss_count").notNull().default(0),
   createdAt: timestamp("created_at").defaultNow(),
 });
@@ -89,13 +94,13 @@ export const notifications = pgTable("notifications", {
   itemIcon: text("item_icon"),
   region: text("region").notNull().default("RU"),
   lotId: text("lot_id"),
-  price: integer("price").notNull().default(0),
+  price: bigint("price", { mode: "number" }).notNull().default(0),
   upgrade: integer("upgrade").notNull().default(0),
   quality: integer("quality").notNull().default(0),
   qualityName: text("quality_name"),
   message: text("message"),
   isRead: boolean("is_read").notNull().default(false),
-  kind: text("kind").notNull().default("buy"), // buy | sell_sold | sell_expired
+  kind: text("kind").notNull().default("buy"), // buy | sell_sold | sell_expired | sell_removed
   targetChatIds: jsonb("target_chat_ids").$type<string[]>(),
   sentChatIds: jsonb("sent_chat_ids").$type<string[]>(),
   sentAt: timestamp("sent_at"),

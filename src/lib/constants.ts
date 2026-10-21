@@ -1,4 +1,5 @@
 export const QUALITY_NAMES: Record<number, string> = {
+  [-1]: "Неизвестна",
   0: "Обычный",
   1: "Необычный",
   2: "Особый",
@@ -8,6 +9,7 @@ export const QUALITY_NAMES: Record<number, string> = {
 };
 
 export const QUALITY_COLORS: Record<number, string> = {
+  [-1]: "#71717a",
   0: "#a1a1aa",
   1: "#4ade80",
   2: "#60a5fa",

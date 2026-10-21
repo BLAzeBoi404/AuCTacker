@@ -2,6 +2,9 @@ import { db } from "@/db";
 import { items } from "@/db/schema";
 import { sql } from "drizzle-orm";
 import { DB_BASE } from "./constants";
+import { normalizeLot, normalizeHistory, type NormalizedLot, type NormalizedHistory } from "./auction-data";
+import { boundedInt } from "./validation";
+export type { NormalizedLot, NormalizedHistory } from "./auction-data";
 
 // Секреты читаются только из окружения Render/.env и никогда не хранятся в коде.
 const CLIENT_ID = process.env.EXBO_CLIENT_ID;
@@ -25,7 +28,7 @@ let tokenPromise: Promise<string> | null = null;
 
 export async function getAccessToken(force = false): Promise<string> {
   if (!force && cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
-  if (!force && tokenPromise) return tokenPromise;
+  if (tokenPromise) return tokenPromise;
   if (!CLIENT_ID || !CLIENT_SECRET) {
     throw new ExboApiError("На сервере не заданы EXBO_CLIENT_ID/EXBO_CLIENT_SECRET", 503);
   }
@@ -54,7 +57,7 @@ export async function getAccessToken(force = false): Promise<string> {
     const data = (await res.json()) as { access_token?: string; expires_in?: number };
     if (!data.access_token) throw new ExboApiError("EXBO не выдал токен доступа", 502);
     cachedToken = data.access_token;
-    tokenExpiresAt = Date.now() + Math.max(30000, (data.expires_in || 3600) * 1000 - 60000);
+    tokenExpiresAt = Date.now() + Math.max(1000, (data.expires_in || 3600) * 900);
     return cachedToken as string;
   })();
   try {
@@ -70,120 +73,11 @@ export function normalizeRegion(r: string | null | undefined): string {
   return "EU";
 }
 
-export interface NormalizedLot {
-  id: string;
-  itemId: string;
-  startPrice: number;
-  buyoutPrice: number;
-  amount: number;
-  endTime: string | null;
-  startTime: string | null;
-  upgrade: number;
-  quality: number;
-}
-
-export interface NormalizedHistory {
-  id: string;
-  price: number;
-  amount: number;
-  time: string | null;
-  upgrade: number;
-  quality: number;
-}
-
-function parseAdditional(src: Record<string, unknown> | undefined | null): {
-  upgrade: number;
-  quality: number;
-} {
-  const add = (src || {}) as Record<string, number>;
-  const num = (v: unknown): number => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : 0;
-  };
-  const upgrade =
-    add.ptn !== undefined
-      ? num(add.ptn)
-      : add.upgrade_level !== undefined
-        ? num(add.upgrade_level)
-        : add.upgrade !== undefined
-          ? num(add.upgrade)
-          : add.enhancement !== undefined
-            ? num(add.enhancement)
-            : 0;
-  const quality =
-    add.qlt !== undefined
-      ? num(add.qlt)
-      : add.quality !== undefined
-        ? num(add.quality)
-        : add.rarity !== undefined
-          ? num(add.rarity)
-          : 0;
-  return {
-    upgrade: Math.max(0, Math.min(30, Math.round(upgrade))),
-    quality: Math.max(0, Math.min(5, Math.round(quality))),
-  };
-}
-
-function toNum(v: unknown): number {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.round(n) : 0;
-}
-
-function toStr(v: unknown): string | null {
-  if (typeof v === "string" && v) return v;
-  return null;
-}
-
-// Стабильный хэш для лотов без id (EAPI не возвращает id лота!)
-function stableHash(s: string): string {
-  let h1 = 0xdeadbeef;
-  let h2 = 0x41c6ce57;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 2654435761);
-    h2 = Math.imul(h2 ^ ch, 1597334677);
-  }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
-}
-
- 
-function normalizeLot(raw: any, itemId: string, idx: number): NormalizedLot {
-  const { upgrade, quality } = parseAdditional(raw?.additional ?? raw?.props ?? raw);
-  const startPrice = toNum(raw?.startPrice ?? raw?.start_price ?? raw?.price ?? 0);
-  const buyoutPrice = toNum(raw?.buyoutPrice ?? raw?.buyout_price ?? raw?.buyPrice ?? raw?.price ?? 0);
-  const amount = toNum(raw?.amount ?? raw?.count ?? raw?.quantity ?? 1) || 1;
-  const endTime = toStr(raw?.endTime ?? raw?.end_time ?? raw?.expiresAt ?? raw?.expires_at);
-  const startTime = toStr(raw?.startTime ?? raw?.start_time ?? raw?.createdAt ?? raw?.created_at);
-  // ВАЖНО: стабильный id, иначе трекер будет спамить «новыми» лотами при каждой проверке
-  const rawId = raw?.id ?? raw?.lotId ?? raw?.uuid;
-  const id =
-    rawId !== undefined && rawId !== null && String(rawId) !== ""
-      ? String(rawId)
-      : `lot-${stableHash(`${itemId}|${startTime}|${endTime}|${startPrice}|${buyoutPrice}|${amount}|${upgrade}|${quality}`)}`;
-  return { id, itemId, startPrice, buyoutPrice, amount, endTime, startTime, upgrade, quality };
-}
-
- 
-function normalizeHistory(raw: any, idx: number): NormalizedHistory {
-  const { upgrade, quality } = parseAdditional(raw?.additional ?? raw?.props ?? raw);
-  const price = toNum(raw?.price ?? raw?.cost ?? 0);
-  const amount = toNum(raw?.amount ?? raw?.count ?? 1) || 1;
-  const time = toStr(raw?.time ?? raw?.date ?? raw?.soldAt ?? raw?.createdAt);
-  const rawId = raw?.id;
-  const id =
-    rawId !== undefined && rawId !== null && String(rawId) !== ""
-      ? String(rawId)
-      : `h-${stableHash(`${price}|${time}|${upgrade}|${quality}|${idx}`)}`;
-  return { id, price, amount, time, upgrade, quality };
-}
-
 async function eapiFetch<T>(path: string, retry = true): Promise<T> {
   const token = await getAccessToken();
   let res: Response;
   try {
-    res = await fetch(`https://eapi.stalcraft.net${path}`, {
+    res = await fetch(`${(process.env.EXBO_API_BASE_URL || "https://eapi.stalzone.com").replace(/\/$/, "")}${path}`, {
       headers: { Authorization: `Bearer ${token}` },
       cache: "no-store",
       signal: AbortSignal.timeout(15000),
@@ -192,7 +86,7 @@ async function eapiFetch<T>(path: string, retry = true): Promise<T> {
     throw new ExboApiError("Официальный аукцион EXBO не ответил", 504);
   }
   if (res.status === 401 && retry) {
-    await getAccessToken(true);
+    if (cachedToken === token) await getAccessToken(true);
     return eapiFetch<T>(path, false);
   }
   if (!res.ok) {
@@ -210,15 +104,15 @@ export async function fetchLots(
   const region = normalizeRegion(regionRaw);
   const id = itemId.trim();
   if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new ExboApiError("Некорректный ID предмета", 400);
-  limit = Math.min(Math.max(1, Math.floor(limit)), 100);
-  offset = Math.max(0, Math.floor(offset));
+  limit = boundedInt(limit, 100, 1, 100);
+  offset = boundedInt(offset, 0, 0, 100_000);
   const d = await eapiFetch<{ lots?: unknown[]; total?: number }>(
     `/${region}/auction/${encodeURIComponent(id)}/lots?limit=${limit}&offset=${offset}&additional=true`,
   );
   if (!Array.isArray(d.lots)) throw new ExboApiError("EXBO изменил формат списка лотов", 502);
    
-  const lots = d.lots.map((x, i) => normalizeLot(x as any, id, i + offset));
-  return { lots, total: Number(d.total ?? lots.length) || lots.length };
+  const lots = d.lots.map((x) => normalizeLot(x, id));
+  return { lots, total: boundedInt(d.total, lots.length, lots.length, Number.MAX_SAFE_INTEGER) };
 }
 
 export async function fetchHistory(
@@ -230,87 +124,61 @@ export async function fetchHistory(
   const region = normalizeRegion(regionRaw);
   const id = itemId.trim();
   if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new ExboApiError("Некорректный ID предмета", 400);
-  limit = Math.min(Math.max(1, Math.floor(limit)), 100);
-  offset = Math.max(0, Math.floor(offset));
+  limit = boundedInt(limit, 100, 1, 100);
+  offset = boundedInt(offset, 0, 0, 100_000);
   const d = await eapiFetch<{ prices?: unknown[]; total?: number }>(
     `/${region}/auction/${encodeURIComponent(id)}/history?limit=${limit}&offset=${offset}&additional=true`,
   );
   if (!Array.isArray(d.prices)) throw new ExboApiError("EXBO изменил формат истории", 502);
    
-  const history = d.prices.map((x, i) => normalizeHistory(x as any, i + offset));
-  return { history, total: Number(d.total ?? history.length) || history.length };
+  const history = d.prices.map((x, i) => normalizeHistory(x, i + offset));
+  return { history, total: boundedInt(d.total, history.length, history.length, Number.MAX_SAFE_INTEGER) };
 }
 
-// ---------- Параллельная загрузка страниц ----------
-// Раньше страницы тянулись строго по очереди: 500 лотов = 5 запросов
-// друг за другом (~5-8 сек ожидания). Теперь грузим пачками по 3 параллельно —
-// в 2-3 раза быстрее, а лимит EXBO (429) обрабатывается как обычная ошибка.
-const PAGE_CONCURRENCY = 3;
+// Сначала узнаём размер выдачи. Для маленького аукциона нужен один запрос,
+// а не три. Остальные страницы загружаем ограниченными пачками.
 const PAGE_SIZE = 100;
+const PAGE_CONCURRENCY = 3;
 
-async function runBatches<T>(offsets: number[], fn: (off: number) => Promise<T[]>): Promise<T[]> {
-  const out: T[] = [];
+async function collectPages<T>(
+  need: number,
+  fetchPage: (limit: number, offset: number) => Promise<{ rows: T[]; total: number }>,
+): Promise<{ rows: T[]; total: number }> {
+  const capped = boundedInt(need, 500, 1, 2000);
+  const first = await fetchPage(Math.min(capped, PAGE_SIZE), 0);
+  const rows = [...first.rows];
+  let total = first.total;
+  const offsets: number[] = [];
+  for (let off = PAGE_SIZE; off < Math.min(capped, total); off += PAGE_SIZE) offsets.push(off);
   for (let i = 0; i < offsets.length; i += PAGE_CONCURRENCY) {
-    const batch = offsets.slice(i, i + PAGE_CONCURRENCY);
-    const parts = await Promise.all(batch.map(fn));
-    for (const p of parts) out.push(...p);
-    // Короткая страница = дальше данных нет
-    if (parts.some((p) => p.length < PAGE_SIZE)) break;
+    const batch = await Promise.all(offsets.slice(i, i + PAGE_CONCURRENCY).map((off) =>
+      fetchPage(Math.min(PAGE_SIZE, capped - off), off),
+    ));
+    for (const page of batch) {
+      rows.push(...page.rows);
+      total = Math.max(total, page.total);
+    }
   }
-  return out;
+  return { rows: rows.slice(0, capped), total };
 }
 
-/** Все лоты предмета (до need) параллельными пачками. Свежие данные, без кэша. */
-export async function fetchLotsAll(
-  itemId: string,
-  regionRaw: string,
-  need = 500,
-): Promise<{ lots: NormalizedLot[]; total: number }> {
-  const region = normalizeRegion(regionRaw);
-  const id = itemId.trim();
-  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new ExboApiError("Некорректный ID предмета", 400);
-  const capped = Math.min(Math.max(1, Math.floor(need)), 2000);
-  const pages = Math.ceil(capped / PAGE_SIZE);
-  const offsets = Array.from({ length: pages }, (_, i) => i * PAGE_SIZE);
-  let total = 0;
-  const lots = await runBatches(offsets, async (off) => {
-    const r = await fetchLots(id, region, PAGE_SIZE, off);
-    total = r.total;
-    return r.lots;
+export async function fetchLotsAll(itemId: string, region: string, need = 500) {
+  const result = await collectPages(need, async (limit, offset) => {
+    const page = await fetchLots(itemId, region, limit, offset);
+    return { rows: page.lots, total: page.total };
   });
-  const sliced = lots.slice(0, capped);
-  const uniq = [...new Map(sliced.map((l) => [l.id, l])).values()];
-  if (total > uniq.length && uniq.length >= capped) {
-    // взяли достаточно для отображения, total честно из API
-  }
-  return { lots: uniq, total: Number(total) || uniq.length };
+  const lots = [...new Map(result.rows.map((lot) => [lot.id, lot])).values()];
+  return { lots, total: result.total, complete: lots.length >= result.total };
 }
 
-/** История продаж (до need) параллельными пачками. Свежие данные, без кэша. */
-export async function fetchHistoryAll(
-  itemId: string,
-  regionRaw: string,
-  need = 400,
-): Promise<{ history: NormalizedHistory[]; total: number }> {
-  const region = normalizeRegion(regionRaw);
-  const id = itemId.trim();
-  if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new ExboApiError("Некорректный ID предмета", 400);
-  const capped = Math.min(Math.max(1, Math.floor(need)), 2000);
-  const pages = Math.ceil(capped / PAGE_SIZE);
-  const offsets = Array.from({ length: pages }, (_, i) => i * PAGE_SIZE);
-  let total = 0;
-  const history = await runBatches(offsets, async (off) => {
-    const r = await fetchHistory(id, region, PAGE_SIZE, off);
-    total = r.total;
-    return r.history;
+export async function fetchHistoryAll(itemId: string, region: string, need = 400) {
+  const result = await collectPages(need, async (limit, offset) => {
+    const page = await fetchHistory(itemId, region, limit, offset);
+    return { rows: page.history, total: page.total };
   });
-  const sliced = history.slice(0, capped);
-  sliced.sort((a, b) => {
-    const ta = a.time ? new Date(a.time).getTime() : 0;
-    const tb = b.time ? new Date(b.time).getTime() : 0;
-    return tb - ta;
-  });
-  return { history: sliced, total: Number(total) || sliced.length };
+  const history = [...new Map(result.rows.map((entry) => [entry.id, entry])).values()];
+  history.sort((a, b) => (b.time ? Date.parse(b.time) : 0) - (a.time ? Date.parse(a.time) : 0));
+  return { history, total: result.total, complete: history.length >= result.total };
 }
 
 // ---------- Словарь предметов ----------
@@ -343,7 +211,7 @@ function normalizeCategory(parts: string[]): string {
 function entryToItem(e: ListingEntry) {
   const dataPath: string = e.data || "";
   const file = dataPath.split("/").pop() || "";
-  const id = file.replace(/\.json$/i, "").toLowerCase();
+  const id = file.replace(/\.json$/i, "");
   if (!id) return null;
   const nameRu = e.name?.lines?.ru || id;
   const nameEn = e.name?.lines?.en || "";

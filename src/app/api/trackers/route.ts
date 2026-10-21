@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { trackers } from "@/db/schema";
-import { and, desc, eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { normalizeRegion } from "@/lib/exbo";
 import { getOwnerKey } from "@/lib/identity";
 import { ensureSchema } from "@/lib/ensure-schema";
-import { invalidateTrackerCache } from "@/lib/tracker-check";
+import { invalidateTrackerCache, liveTrackerRows } from "@/lib/tracker-check";
 import { cached, invalidateOwner } from "@/lib/user-cache";
+
+import { isRecord, trackerConditionsError, validItemId } from "@/lib/validation";
 
 export const dynamic = "force-dynamic";
 
@@ -21,7 +23,7 @@ export async function GET() {
     const rows = await cached(`trackers:${owner}`, () =>
       db.select().from(trackers).where(eq(trackers.ownerKey, owner)).orderBy(desc(trackers.createdAt)),
     );
-    return NextResponse.json({ success: true, trackers: rows });
+    return NextResponse.json({ success: true, trackers: liveTrackerRows(rows) });
   } catch (e) {
     console.error("GET /api/trackers failed:", e);
     return NextResponse.json({ success: false, trackers: [] });
@@ -32,11 +34,15 @@ export async function POST(req: NextRequest) {
   try {
     await ensureSchema();
     const owner = await getOwnerKey();
-    const body = await req.json();
-    const itemId = String(body.itemId || "").toLowerCase().trim();
-    if (!itemId) {
+    const body = await req.json().catch(() => null);
+    if (!isRecord(body)) return NextResponse.json({ success: false, message: "Неверный формат запроса." }, { status: 400 });
+    const itemId = String(body.itemId || "").trim();
+    if (!validItemId(itemId)) {
       return NextResponse.json({ success: false, error: "itemId_required" }, { status: 400 });
     }
+
+    const error = trackerConditionsError(body);
+    if (error) return NextResponse.json({ success: false, message: error }, { status: 400 });
 
     const mine = await db
       .select({ id: trackers.id })
@@ -56,15 +62,16 @@ export async function POST(req: NextRequest) {
         itemId,
         itemName: String(body.itemName || itemId),
         itemIcon: body.itemIcon ? String(body.itemIcon) : null,
-        region: normalizeRegion(body.region),
-        upgradeMode: ["exact", "min", "any"].includes(body.upgradeMode) ? body.upgradeMode : "exact",
+        region: normalizeRegion(typeof body.region === "string" ? body.region : undefined),
+        upgradeMode: ["exact", "min", "any"].includes(String(body.upgradeMode)) ? String(body.upgradeMode) : "exact",
         targetUpgrade: Math.max(0, Math.min(30, Number(body.targetUpgrade) || 0)),
+        qualityMode: body.qualityMode === "min" ? "min" : "exact",
         targetQuality: [-1, 0, 1, 2, 3, 4, 5].includes(Number(body.targetQuality))
           ? Number(body.targetQuality)
           : -1,
         maxPrice: Math.max(0, Number(body.maxPrice) || 0),
         minPrice: Math.max(0, Number(body.minPrice) || 0),
-        enabled: body.enabled ?? true,
+        enabled: body.enabled === undefined ? true : Boolean(body.enabled),
         enableSound: false,
         enableBrowser: false,
         notifyChatIds: [],

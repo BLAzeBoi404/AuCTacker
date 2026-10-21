@@ -46,7 +46,7 @@ export default function HomeView({
             Auc<span className="text-[#34d399]">Tracker</span>
           </h1>
           <p className="mt-3 max-w-xl text-[15px] leading-relaxed text-zinc-400">
-            Цены, история продаж, трекинг предметов и калькулятор сборок — в одном
+            Цены, история продаж, трекинг предметов — в одном
             месте. Уведомления о нужных лотах приходят прямо в Telegram, даже если
             вы не открываете сайт.
           </p>

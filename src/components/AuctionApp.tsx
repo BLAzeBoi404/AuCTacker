@@ -20,6 +20,7 @@ import {
 import {
   QUALITY_NAMES, QUALITY_COLORS, REGIONS, categoryLabel,
 } from "@/lib/constants";
+import { normalizeSearch, searchRank } from "@/lib/search";
 
 // ---------- Types ----------
 interface Item {
@@ -62,6 +63,7 @@ interface Tracker {
   upgradeMode: string;
   targetUpgrade: number;
   targetQuality: number;
+  qualityMode: "exact" | "min";
   maxPrice: number;
   minPrice: number;
   enabled: boolean;
@@ -166,7 +168,10 @@ interface SellTracker {
   startTime: string | null;
   expectedEndTime: string | null;
   listedDurationH: number | null;
-  status: "active" | "sold" | "expired";
+  status: "active" | "sold" | "expired" | "removed";
+  firstMissingAt: string | null;
+  lastCheckedAt: string | null;
+  lastError: string | null;
   lastSeenAt: string | null;
   finishedAt: string | null;
   finishPrice: number | null;
@@ -181,21 +186,22 @@ const itemIcon = (it: Item | null | undefined) =>
 
 async function fetchJson<T>(url: string, opts?: RequestInit, timeoutMs = 20000, externalSignal?: AbortSignal): Promise<T> {
   const ctrl = new AbortController();
-  if (externalSignal) {
-    if (externalSignal.aborted) ctrl.abort();
-    else externalSignal.addEventListener("abort", () => ctrl.abort(), { once: true });
-  }
+  const sourceSignal = externalSignal ?? opts?.signal;
+  const onAbort = () => ctrl.abort();
+  if (sourceSignal?.aborted) ctrl.abort();
+  else sourceSignal?.addEventListener("abort", onAbort, { once: true });
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const { signal: _ignored, ...rest } = opts || {};
     const r = await fetch(url, { cache: "no-store", ...rest, signal: ctrl.signal });
     const data = await r.json().catch(() => null) as (T & { success?: boolean; message?: string }) | null;
-    if (!r.ok || data?.success === false) {
+    if (!r.ok || !data || data.success === false) {
       throw new Error(data?.message || `HTTP ${r.status}`);
     }
     return data as T;
   } finally {
     clearTimeout(t);
+    sourceSignal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -289,6 +295,8 @@ export default function AuctionApp() {
   const [searchLoading, setSearchLoading] = useState(false);
   const [activeIdx, setActiveIdx] = useState(-1);
   const searchRef = useRef<HTMLDivElement>(null);
+  const resultsQuery = useRef("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const catalogTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -299,6 +307,8 @@ export default function AuctionApp() {
   const [history, setHistory] = useState<HistEntry[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyTotal, setHistoryTotal] = useState(0);
   const [activeTab, setActiveTab] = useState<"lots" | "history">("lots");
   const [timeframe, setTimeframe] = useState<"24h" | "7d" | "30d" | "all">("7d");
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
@@ -318,6 +328,7 @@ export default function AuctionApp() {
   const searchAbort = useRef<AbortController | null>(null);
   const catalogSeq = useRef(0);
   const catalogAbort = useRef<AbortController | null>(null);
+  const catalogScrollPending = useRef(false);
   const histCycle = useRef(0);
 
   // ---------- Filters ----------
@@ -338,16 +349,16 @@ export default function AuctionApp() {
   const [trackers, setTrackers] = useState<Tracker[]>([]);
   const [showTrackerModal, setShowTrackerModal] = useState(false);
   const [trackerForm, setTrackerForm] = useState({
-    upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1,
+    upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1, qualityMode: "exact",
     maxPrice: 0, minPrice: 0,
   });
   const [checking, setChecking] = useState(false);
+  const [trackerSaving, setTrackerSaving] = useState(false);
 
   // ---------- Трекеры продаж (мои выставленные лоты) ----------
   const [sellTrackers, setSellTrackers] = useState<SellTracker[]>([]);
   const [trackerTab, setTrackerTab] = useState<"buy" | "sell">("buy");
   const [sellLot, setSellLot] = useState<Lot | null>(null);
-  const [sellQualityMode, setSellQualityMode] = useState<"exact" | "min">("exact");
   const [sellBusy, setSellBusy] = useState(false);
 
   // ---------- Notifications ----------
@@ -374,13 +385,14 @@ export default function AuctionApp() {
   useEffect(() => {
     try {
       const r = lsGet("region");
-      if (r) setRegion(r);
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- Синхронизация с внешним API/сохранённым состоянием браузера; запросы отменяются при смене параметров.
+      if (r && REGIONS.some((entry) => entry.id === r)) setRegion(r);
       const it = lsGet("item");
       const params = new URLSearchParams(window.location.search);
       const urlItem = params.get("item");
       if (urlItem) {
-        fetchJson<{ success: boolean; item: Item }>(`/api/items/${urlItem.toLowerCase()}`)
-          .then((d) => { if (d.success && d.item) { setSelectedItem(d.item); setSearchQuery(itemName(d.item)); } })
+        fetchJson<{ success: boolean; item: Item }>(`/api/items/${encodeURIComponent(urlItem)}`)
+          .then((d) => { if (d.success && d.item) { setSelectedItem(d.item); setSearchQuery(itemName(d.item)); setView("auction"); } })
           .catch(() => {});
       } else if (it) {
         try {
@@ -398,7 +410,7 @@ export default function AuctionApp() {
       if (searchRef.current && !searchRef.current.contains(e.target as Node)) setShowDropdown(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setShowDropdown(false); setShowTrackerModal(false); setShowNotifs(false); }
+      if (e.key === "Escape") { setShowDropdown(false); setShowTrackerModal(false); setSellLot(null); setShowNotifs(false); setRegionOpen(false); }
     };
     document.addEventListener("mousedown", onClick);
     document.addEventListener("keydown", onKey);
@@ -433,12 +445,14 @@ export default function AuctionApp() {
         abort.signal,
       );
       if (lotsGen.current !== gen || abort.signal.aborted) return;
+      setApiError(null);
       setLots(d.lots || []);
       setLotsTotal(d.total || (d.lots || []).length);
       setLastUpdate(new Date());
       setNextRefreshAt(Date.now() + LOTS_MS);
     } catch (error) {
       if (lotsGen.current !== gen || abort.signal.aborted) return;
+      setApiError(error instanceof Error ? error.message : "Не удалось обновить аукцион EXBO.");
       if (!silent) {
         setLots([]);
         setLotsTotal(0);
@@ -459,8 +473,9 @@ export default function AuctionApp() {
     const abort = new AbortController();
     histAbort.current = abort;
     if (!silent) setHistoryLoading(true);
+    setHistoryError(null);
     try {
-      const d = await fetchJson<{ success: boolean; history: HistEntry[] }>(
+      const d = await fetchJson<{ success: boolean; history: HistEntry[]; total: number }>(
         `/api/history?itemId=${encodeURIComponent(itemId)}&region=${reg}&limit=600`,
         undefined,
         20000,
@@ -469,13 +484,58 @@ export default function AuctionApp() {
       if (histGen.current !== gen || abort.signal.aborted) return;
       setHistory(d.history || []);
       setHistoryLoaded(true);
-    } catch {
+      setHistoryTotal(d.total ?? d.history.length);
+    } catch (error) {
       if (histGen.current !== gen || abort.signal.aborted) return;
+      setHistoryError(error instanceof Error ? error.message : "История EXBO недоступна.");
       if (!silent) setHistory([]);
     } finally {
       if (histGen.current === gen) setHistoryLoading(false);
     }
   }, []);
+
+  const loadCatalog = useCallback(async (q: string, cat: string, pg: number) => {
+    const seq = ++catalogSeq.current;
+    catalogAbort.current?.abort();
+    const abort = new AbortController();
+    catalogAbort.current = abort;
+    setCatalogLoading(true);
+    // Долгий холодный старт Neon — даём запас; при пустом ответе на первой попытке повторяем.
+    const fetchOnce = async () => {
+      const off = (pg - 1) * catalogPerPage;
+      return fetchJson<{ success: boolean; items: Item[]; total: number; needsSync?: boolean; categories: { category: string; count: number }[] }>(
+        `/api/items?q=${encodeURIComponent(q)}&category=${encodeURIComponent(cat)}&limit=${catalogPerPage}&offset=${off}`,
+        undefined,
+        45000,
+        abort.signal,
+      );
+    };
+    try {
+      let d = await fetchOnce();
+      // Если предметы почему-то пришли пустыми, а всего их много — повтор один раз
+      if ((!d.items || d.items.length === 0) && (d.total || 0) > 0 && !q && !abort.signal.aborted) {
+        d = await fetchOnce();
+      }
+      if (catalogSeq.current !== seq || abort.signal.aborted) return;
+      setCatalogItems(d.items || []);
+      setCatalogTotal(d.total || 0);
+      setCatalogNeedsSync(!!d.needsSync && (d.total || 0) === 0);
+      if (d.categories?.length) setCategories(d.categories);
+    } catch {
+      if (catalogSeq.current === seq && !abort.signal.aborted) setCatalogItems([]);
+    } finally {
+      if (catalogSeq.current === seq) setCatalogLoading(false);
+    }
+  }, []);
+
+
+  const loadSellTrackers = useCallback(async () => {
+    try {
+      const d = await fetchJson<{ success: boolean; sellTrackers: SellTracker[] }>("/api/sell-trackers");
+      setSellTrackers(d.sellTrackers || []);
+    } catch { /* ignore */ }
+  }, []);
+
 
   const loadTrackers = useCallback(async () => {
     try {
@@ -791,11 +851,13 @@ export default function AuctionApp() {
   }, [pushToast, catalogQuery, catalogCategory]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Синхронизация с внешним API/сохранённым состоянием браузера; запросы отменяются при смене параметров.
     if (view === "admin") loadSettings();
     if (view === "telegram") loadMyTg();
   }, [view, loadSettings, loadMyTg]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Синхронизация с внешним API/сохранённым состоянием браузера; запросы отменяются при смене параметров.
     if (showTrackerModal) loadMyTg();
   }, [showTrackerModal, loadMyTg]);
 
@@ -811,61 +873,33 @@ export default function AuctionApp() {
     }
   };
 
-  const loadCatalog = useCallback(async (q: string, cat: string, pg: number) => {
-    const seq = ++catalogSeq.current;
-    catalogAbort.current?.abort();
-    const abort = new AbortController();
-    catalogAbort.current = abort;
-    setCatalogLoading(true);
-    // Долгий холодный старт Neon — даём запас; при пустом ответе на первой попытке повторяем.
-    const fetchOnce = async () => {
-      const off = (pg - 1) * catalogPerPage;
-      return fetchJson<{ success: boolean; items: Item[]; total: number; needsSync?: boolean; categories: { category: string; count: number }[] }>(
-        `/api/items?q=${encodeURIComponent(q)}&category=${encodeURIComponent(cat)}&limit=${catalogPerPage}&offset=${off}`,
-        undefined,
-        45000,
-        abort.signal,
-      );
-    };
-    try {
-      let d = await fetchOnce();
-      // Если предметы почему-то пришли пустыми, а всего их много — повтор один раз
-      if ((!d.items || d.items.length === 0) && (d.total || 0) > 0 && !q && !abort.signal.aborted) {
-        d = await fetchOnce();
-      }
-      if (catalogSeq.current !== seq || abort.signal.aborted) return;
-      setCatalogItems(d.items || []);
-      setCatalogTotal(d.total || 0);
-      setCatalogNeedsSync(!!d.needsSync && (d.total || 0) === 0);
-      if (d.categories?.length) setCategories(d.categories);
-    } catch {
-      if (catalogSeq.current === seq && !abort.signal.aborted) setCatalogItems([]);
-    } finally {
-      if (catalogSeq.current === seq) setCatalogLoading(false);
-    }
-  }, []);
 
   // Смена предмета/региона: мгновенно сбрасываем старые данные,
   // чтобы не показывать цены предыдущего предмета, и грузим новые.
   // Тихие автообновления (silent) экран при этом не трогают.
   useEffect(() => {
     if (selectedItem?.id && region) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- Синхронизация с внешним API/сохранённым состоянием браузера; запросы отменяются при смене параметров.
       setPage(1);
       setHistoryPage(1);
       setLots([]);
       setLotsTotal(0);
       setHistory([]);
       setHistoryLoaded(false);
+      setHistoryError(null);
+      setHistoryTotal(0);
+      setLastUpdate(null);
       setApiError(null);
       setLotsLoading(true);
       setHistoryLoading(true);
       fetchLots(selectedItem.id, region);
       fetchHistory(selectedItem.id, region);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedItem?.id, region]);
+    return () => { lotsAbort.current?.abort(); histAbort.current?.abort(); };
+  }, [selectedItem?.id, region, fetchLots, fetchHistory]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Синхронизация с внешним API/сохранённым состоянием браузера; запросы отменяются при смене параметров.
     loadSession();
     loadTrackers();
     loadSellTrackers();
@@ -875,6 +909,7 @@ export default function AuctionApp() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Синхронизация с внешним API/сохранённым состоянием браузера; запросы отменяются при смене параметров.
     if (view === "catalog") loadCatalog(catalogQuery, catalogCategory, catalogPage);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, catalogCategory, catalogPage]);
@@ -891,7 +926,7 @@ export default function AuctionApp() {
     if (!autoRefresh || view !== "auction" || !selectedItem?.id) return;
     histCycle.current = 0;
     const tick = () => {
-      if (!selectedItem?.id) return;
+      if (!selectedItem?.id || document.visibilityState !== "visible") return;
       fetchLots(selectedItem.id, region, true);
       histCycle.current += 1;
       if (historyLoaded && histCycle.current % 3 === 0) {
@@ -927,47 +962,60 @@ export default function AuctionApp() {
   }, [autoRefresh, view, selectedItem?.id, region, historyLoaded, nextRefreshAt, fetchLots, fetchHistory]);
 
   // ---------- Поиск ----------
-  const doSearch = useCallback(async (q: string) => {
+  const doSearch = useCallback(async (q: string): Promise<Item[] | null> => {
     const seq = ++searchSeq.current;
     searchAbort.current?.abort();
     const abort = new AbortController();
     searchAbort.current = abort;
     setSearchLoading(true);
     try {
-      const d = await fetchJson<{ success: boolean; items: Item[]; total: number }>(
-        `/api/items?q=${encodeURIComponent(q)}&limit=12`,
-        undefined,
-        15000,
-        abort.signal,
+      const data = await fetchJson<{ success: boolean; items: Item[]; total: number }>(
+        `/api/items?q=${encodeURIComponent(q)}&limit=12`, undefined, 45000, abort.signal,
       );
-      if (searchSeq.current !== seq || abort.signal.aborted) return; // пришёл более свежий запрос — этот выбрасываем
-      setSearchResults(d.items || []);
-      setSearchTotal(d.total || 0);
-    } catch {
-      if (searchSeq.current === seq && !abort.signal.aborted) setSearchResults([]);
+      if (searchSeq.current !== seq || abort.signal.aborted) return null;
+      const found = data.items || [];
+      resultsQuery.current = normalizeSearch(q);
+      setSearchResults(found);
+      setSearchTotal(data.total || 0);
+      return found;
+    } catch (error) {
+      if (searchSeq.current !== seq || abort.signal.aborted) return null;
+      setSearchResults([]);
+      setSearchTotal(0);
+      pushToast("Поиск недоступен", error instanceof Error ? error.message : "Попробуйте ещё раз.");
+      return null;
     } finally {
       if (searchSeq.current === seq) setSearchLoading(false);
     }
-  }, []);
+  }, [pushToast]);
 
-  const onSearchInput = (v: string) => {
-    setSearchQuery(v);
+  const onSearchInput = (value: string) => {
+    searchSeq.current++;
+    searchAbort.current?.abort();
+    resultsQuery.current = "";
+    setSearchResults([]);
+    setSearchTotal(0);
+    setSearchLoading(false);
+    setSearchQuery(value);
     setShowDropdown(true);
     setActiveIdx(-1);
     if (searchTimer.current) clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => doSearch(v), 180);
+    searchTimer.current = setTimeout(() => void doSearch(value), 180);
   };
 
   const selectItem = (item: Item) => {
-    // Мгновенно отменяем все висящие запросы прошлого предмета
-    lotsAbort.current?.abort();
-    histAbort.current?.abort();
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    if (catalogTimer.current) clearTimeout(catalogTimer.current);
+    if (item.id !== selectedItem?.id) {
+      lotsAbort.current?.abort();
+      histAbort.current?.abort();
+      lotsGen.current++;
+      histGen.current++;
+    }
     searchAbort.current?.abort();
-    catalogAbort.current?.abort();
-    lotsGen.current++;
-    histGen.current++;
     searchSeq.current++;
-    catalogSeq.current++;
+    setSearchLoading(false);
+    searchInputRef.current?.blur();
     setSelectedItem(item);
     setSearchQuery(itemName(item));
     setShowDropdown(false);
@@ -987,27 +1035,26 @@ export default function AuctionApp() {
     } catch { /* ignore */ }
   };
 
-  // Enter: если подсвечен вариант — открываем его. Если нет — берём первый
-  // результат поиска. Это же работает и на телефоне: кнопка Enter на клавиатуре
-  // превращается в «поиск», и предмет открывается без отдельного тапа по списку.
-  const onSearchKey = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      const picked = activeIdx >= 0 ? searchResults[activeIdx] : searchResults[0];
-      if (picked) {
-        selectItem(picked);
-        return;
-      }
-      // Результатов ещё нет (дебаунс не отработал) — ищем сразу
-      if (searchQuery.trim()) {
-        setShowDropdown(false);
-        void doSearch(searchQuery.trim());
-      }
-      return;
+  const submitSearch = async () => {
+    const q = searchQuery.trim();
+    if (!q) return;
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    if (showDropdown && activeIdx >= 0 && resultsQuery.current === normalizeSearch(q)) {
+      const highlighted = searchResults[activeIdx];
+      if (highlighted) { selectItem(highlighted); return; }
     }
-    if (!showDropdown || searchResults.length === 0) return;
-    if (e.key === "ArrowDown") { e.preventDefault(); setActiveIdx((i) => Math.min(i + 1, searchResults.length - 1)); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); }
+    const found = await doSearch(q);
+    if (found === null) return;
+    const picked = [...found].sort((a, b) => searchRank(a, q) - searchRank(b, q))[0];
+    if (picked) selectItem(picked);
+    else { setShowDropdown(true); pushToast("Ничего не найдено", `Проверьте название «${q}».`); }
+  };
+
+  const onSearchKey = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter" && event.nativeEvent.isComposing) { event.preventDefault(); return; }
+    if (!showDropdown || !searchResults.length) return;
+    if (event.key === "ArrowDown") { event.preventDefault(); setActiveIdx((i) => Math.min(i + 1, searchResults.length - 1)); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); }
   };
 
   // ---------- Проверка трекеров ----------
@@ -1021,6 +1068,7 @@ export default function AuctionApp() {
         matches: { trackerId: number; itemId: string; itemName: string; itemIcon: string | null; price: number; upgrade: number; quality: number; qualityName: string; region: string }[];
       }>("/api/trackers/check", { method: "POST" });
       loadTrackers();
+      loadSellTrackers();
       loadNotifications();
       if (d.matches?.length > 0) {
         for (const m of d.matches.slice(0, 5)) {
@@ -1057,7 +1105,8 @@ export default function AuctionApp() {
 
   // ---------- Tracker CRUD ----------
   const saveTracker = async () => {
-    if (!selectedItem) return;
+    if (!selectedItem || trackerSaving) return;
+    setTrackerSaving(true);
     try {
       const d = await fetchJson<{ success: boolean; error?: string; message?: string }>("/api/trackers", {
         method: "POST",
@@ -1077,29 +1126,22 @@ export default function AuctionApp() {
       setShowTrackerModal(false);
       loadTrackers();
       pushToast("Трекер создан", `${itemName(selectedItem)} — слежка запущена.`);
-      setTrackerForm({ upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1, maxPrice: 0, minPrice: 0 });
-    } catch {
-      pushToast("Ошибка", "Не удалось создать трекер.");
-    }
+      setTrackerForm({ upgradeMode: "exact", targetUpgrade: 0, targetQuality: -1, qualityMode: "exact", maxPrice: 0, minPrice: 0 });
+    } catch (error) {
+      pushToast("Ошибка", error instanceof Error ? error.message : "Не удалось создать трекер.");
+    } finally { setTrackerSaving(false); }
   };
 
   const deleteTracker = async (id: number) => {
     try {
-      await fetch(`/api/trackers/${id}`, { method: "DELETE" });
+      await fetchJson(`/api/trackers/${id}`, { method: "DELETE" });
       loadTrackers();
     } catch { /* ignore */ }
   };
 
-  const loadSellTrackers = useCallback(async () => {
-    try {
-      const d = await fetchJson<{ success: boolean; sellTrackers: SellTracker[] }>("/api/sell-trackers");
-      setSellTrackers(d.sellTrackers || []);
-    } catch { /* ignore */ }
-  }, []);
 
   const openSellModal = useCallback((lot: Lot) => {
     setSellLot(lot);
-    setSellQualityMode("exact");
   }, []);
 
   const saveSellTracker = useCallback(async () => {
@@ -1123,7 +1165,6 @@ export default function AuctionApp() {
             quality: sellLot.quality,
             qualityName: sellLot.qualityName,
             endTime: sellLot.endTime,
-            qualityMode: sellQualityMode,
           }),
         },
         30000,
@@ -1147,18 +1188,18 @@ export default function AuctionApp() {
     } finally {
       setSellBusy(false);
     }
-  }, [selectedItem, sellLot, sellQualityMode, region, loadSellTrackers, loadNotifications, pushToast]);
+  }, [selectedItem, sellLot, region, loadSellTrackers, loadNotifications, pushToast]);
 
   const deleteSellTracker = useCallback(async (id: number) => {
     try {
-      await fetch(`/api/sell-trackers/${id}`, { method: "DELETE" });
+      await fetchJson(`/api/sell-trackers/${id}`, { method: "DELETE" });
       loadSellTrackers();
     } catch { /* ignore */ }
   }, [loadSellTrackers]);
 
   const toggleTracker = async (t: Tracker) => {
     try {
-      await fetch(`/api/trackers/${t.id}`, {
+      await fetchJson(`/api/trackers/${t.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: !t.enabled }),
@@ -1167,7 +1208,35 @@ export default function AuctionApp() {
     } catch { /* ignore */ }
   };
 
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState !== "visible") return;
+      void loadNotifications();
+      if (view === "trackers") { void loadTrackers(); void loadSellTrackers(); }
+    };
+    const timer = setInterval(refresh, 60000);
+    document.addEventListener("visibilitychange", refresh);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Синхронизация с внешним API/сохранённым состоянием браузера; запросы отменяются при смене параметров.
+    if (view === "trackers") { void loadTrackers(); void loadSellTrackers(); void loadMyTg(); }
+    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", refresh); };
+  }, [view, loadNotifications, loadTrackers, loadSellTrackers, loadMyTg]);
+
+  useEffect(() => {
+    if (!showTrackerModal && !sellLot && !showNotifs) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previous; };
+  }, [showTrackerModal, sellLot, showNotifs]);
+
+  useEffect(() => () => {
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    if (catalogTimer.current) clearTimeout(catalogTimer.current);
+    searchAbort.current?.abort(); catalogAbort.current?.abort();
+    lotsAbort.current?.abort(); histAbort.current?.abort();
+  }, []);
+
   // ---------- Derived ----------
+  const dataNow = Math.floor(nowMs / 60000) * 60000;
   const stats = useMemo(() => {
     const prices = lots
       .map((l) => perUnit(l.buyoutPrice || l.startPrice, l.amount))
@@ -1186,7 +1255,7 @@ export default function AuctionApp() {
     const lastEntry = history.find((h) => h.price > 0);
     const last = lastEntry ? unit(lastEntry) : 0;
     if (!prices.length) return { last, min: 0, max: 0, avg: 0, count: history.length, change: 0 };
-    const now = Date.now();
+    const now = dataNow;
     const last24 = history.filter((h) => h.time && now - new Date(h.time).getTime() < 86400000).map(unit).filter((p) => p > 0);
     const prev24 = history.filter((h) => {
       if (!h.time) return false;
@@ -1195,7 +1264,7 @@ export default function AuctionApp() {
     }).map(unit).filter((p) => p > 0);
     const avg = (a: number[]) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
     const a24 = avg(last24), ap = avg(prev24);
-    const change = ap > 0 ? ((a24 - ap) / ap) * 100 : 0;
+    const change = ap > 0 && last24.length > 0 ? ((a24 - ap) / ap) * 100 : 0;
     return {
       last,
       min: Math.min(...prices),
@@ -1204,15 +1273,15 @@ export default function AuctionApp() {
       count: history.length,
       change: Math.round(change * 10) / 10,
     };
-  }, [history]);
+  }, [history, dataNow]);
 
   const chartData = useMemo(() => {
-    const now = Date.now();
+    const now = dataNow;
     const ms = timeframe === "24h" ? 86400000 : timeframe === "7d" ? 7 * 86400000 : timeframe === "30d" ? 30 * 86400000 : Infinity;
     return history
       .filter((h) => h.price > 0 && h.time && now - new Date(h.time).getTime() < ms)
       .map((h) => ({ time: h.time, price: perUnit(h.price, h.amount || 1) }));
-  }, [history, timeframe]);
+  }, [history, timeframe, dataNow]);
 
   const processedLots = useMemo(() => {
     let r = [...lots];
@@ -1241,7 +1310,7 @@ export default function AuctionApp() {
   // ---------- Фильтрация истории продаж ----------
   const processedHistory = useMemo(() => {
     let r = [...history];
-    const now = Date.now();
+    const now = dataNow;
     const ms = historyTimeframe === "24h" ? 86400000 : historyTimeframe === "7d" ? 7 * 86400000 : historyTimeframe === "30d" ? 30 * 86400000 : Infinity;
     
     // Фильтр по периоду
@@ -1258,7 +1327,7 @@ export default function AuctionApp() {
     }
     
     return r;
-  }, [history, historyFilterUpgrade, historyFilterQuality, historyTimeframe]);
+  }, [history, historyFilterUpgrade, historyFilterQuality, historyTimeframe, dataNow]);
 
   // Статистика по отфильтрованной истории (для правой панели)
   const historyFilteredStats = useMemo(() => {
@@ -1296,30 +1365,45 @@ export default function AuctionApp() {
   }, [processedHistory]);
 
   const totalPages = Math.max(1, Math.ceil(processedLots.length / perPage));
-  const paginatedLots = processedLots.slice((page - 1) * perPage, page * perPage);
+  const currentPage = Math.min(page, totalPages);
+  const paginatedLots = processedLots.slice((currentPage - 1) * perPage, currentPage * perPage);
   const totalHistoryPages = Math.max(1, Math.ceil(processedHistory.length / perPage));
-  const paginatedHistory = processedHistory.slice((historyPage - 1) * perPage, historyPage * perPage);
+  const currentHistoryPage = Math.min(historyPage, totalHistoryPages);
+  const paginatedHistory = processedHistory.slice((currentHistoryPage - 1) * perPage, currentHistoryPage * perPage);
 
   // Перелистнул страницу → экран поднимается к началу списка,
   // иначе пользователь оказывается внизу и думает, что данные не сменились.
   const lotListTopRef = useRef<HTMLDivElement>(null);
   const histListTopRef = useRef<HTMLDivElement>(null);
-  const scrollTopOf = (ref: React.RefObject<HTMLDivElement | null>) => {
-    const el = ref?.current;
-    if (!el) return;
-    const top = el.getBoundingClientRect().top + window.scrollY - 80; // запас под sticky-шапку
-    window.scrollTo({ top, behavior: "smooth" });
-  };
+  const catalogListTopRef = useRef<HTMLDivElement>(null);
+  const scrollTopOf = useCallback((ref: React.RefObject<HTMLDivElement | null>) => {
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      const top = Math.max(0, el.getBoundingClientRect().top + window.scrollY - 72);
+      window.scrollTo({ top, behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    });
+  }, []);
   const gotoLotsPage = (next: number) => {
-    const changed = next !== page;
     setPage(next);
-    if (changed) scrollTopOf(lotListTopRef);
+    if (next !== currentPage) scrollTopOf(lotListTopRef);
   };
   const gotoHistoryPage = (next: number) => {
-    const changed = next !== historyPage;
     setHistoryPage(next);
-    if (changed) scrollTopOf(histListTopRef);
+    if (next !== currentHistoryPage) scrollTopOf(histListTopRef);
   };
+  const gotoCatalogPage = (next: number) => {
+    if (next === catalogPage) return;
+    catalogScrollPending.current = true;
+    setCatalogLoading(true);
+    setCatalogPage(next);
+  };
+  useEffect(() => {
+    if (!catalogLoading && catalogScrollPending.current) {
+      catalogScrollPending.current = false;
+      scrollTopOf(catalogListTopRef);
+    }
+  }, [catalogLoading, scrollTopOf]);
   const catalogTotalPages = Math.max(1, Math.ceil(catalogTotal / catalogPerPage));
   const enabledTrackers = trackers.filter((t) => t.enabled);
 
@@ -1341,7 +1425,7 @@ export default function AuctionApp() {
         <div className="absolute -right-48 top-2/3 h-96 w-96 rounded-full bg-sky-500/[0.06] blur-[110px]" />
       </div>
       {/* ===== Navbar ===== */}
-      <header className="sticky top-0 z-50 border-b border-zinc-800/80 bg-[#0a0a0c]/90 shadow-[0_8px_30px_rgba(0,0,0,0.45)] backdrop-blur-xl">
+      <header className="app-header sticky top-0 z-50 border-b border-zinc-800/80 bg-[#0a0a0c]/90 shadow-[0_8px_30px_rgba(0,0,0,0.45)] backdrop-blur-xl">
         <div className="mx-auto flex h-14 max-w-[1280px] items-center gap-2 px-4">
           <button onClick={() => setView("home")} className="group flex items-center gap-2">
             <span className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-[#34d399] to-[#059669] text-black shadow-[0_0_18px_rgba(52,211,153,0.35)] transition group-hover:shadow-[0_0_26px_rgba(52,211,153,0.55)]">
@@ -1350,7 +1434,7 @@ export default function AuctionApp() {
             <span className="text-[15px] font-extrabold tracking-wide text-white">AucTracker</span>
           </button>
 
-          <nav className="ml-2 flex flex-1 items-center gap-1 overflow-x-auto md:ml-6 md:flex-none [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <nav className="ml-4 hidden flex-1 items-center gap-1 overflow-x-auto lg:flex [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             <button onClick={() => setView("auction")} className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition ${view === "auction" ? "bg-zinc-800 text-white shadow-inner" : "text-zinc-400 hover:bg-zinc-800/50 hover:text-white"}`}>
               <Gavel className="h-3.5 w-3.5 shrink-0" />Аукцион
             </button>
@@ -1381,7 +1465,7 @@ export default function AuctionApp() {
                 className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5 text-[13px] font-medium text-zinc-200 hover:border-zinc-700"
               >
                 <span className="h-2 w-2 rounded-full bg-emerald-400 live-dot" />
-                {regionLabel}
+                <span className="hidden sm:inline">{regionLabel}</span><span className="sm:hidden">{region}</span>
                 <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />
               </button>
               {regionOpen && (
@@ -1421,45 +1505,55 @@ export default function AuctionApp() {
         </div>
       </header>
 
-      <main className="relative mx-auto max-w-[1280px] px-4 pb-24 pt-5">
+      <nav aria-label="Мобильная навигация" className="mobile-bottom-nav fixed inset-x-0 bottom-0 z-[60] flex border-t border-zinc-800 bg-[#0a0a0c]/95 backdrop-blur-xl lg:hidden">
+        {([
+          { id: "auction", title: "Аукцион", icon: Gavel },
+          { id: "catalog", title: "Предметы", icon: Package },
+          { id: "trackers", title: "Трекеры", icon: Crosshair },
+          { id: "telegram", title: "Telegram", icon: Send },
+          ...(isAdmin ? [{ id: "admin", title: "Админ", icon: SettingsIcon }] : []),
+        ] as const).map((entry) => (
+          <button key={entry.id} aria-current={view === entry.id ? "page" : undefined}
+            onClick={() => { setView(entry.id as typeof view); window.scrollTo({ top: 0 }); }}
+            className={`flex min-h-16 min-w-0 flex-1 flex-col items-center justify-center gap-1 text-[11px] font-medium ${view === entry.id ? "text-[#34d399]" : "text-zinc-400"}`}>
+            <entry.icon className="h-5 w-5" />{entry.title}
+          </button>
+        ))}
+      </nav>
+
+      <main className="app-main relative mx-auto max-w-[1280px] px-4 pb-24 pt-5">
         {/* ===== Поиск (скрыт на главной) ===== */}
         {view !== "home" && (
         <div ref={searchRef} className="relative z-30 mx-auto max-w-3xl">
+          <form role="search" className="relative" onSubmit={(event) => { event.preventDefault(); void submitSearch(); }}>
           <div className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500">
             <Search className="h-4 w-4" />
           </div>
           <input
+            ref={searchInputRef}
+            aria-label="Поиск предмета"
+            autoComplete="off"
             type="search"
             enterKeyHint="search"
             value={searchQuery}
             onChange={(e) => onSearchInput(e.target.value)}
             onFocus={() => { setShowDropdown(true); if (searchResults.length === 0) doSearch(searchQuery); }}
             onKeyDown={onSearchKey}
-            placeholder="Быстрый поиск предмета… (название, ID или категория)"
-            className="w-full rounded-xl border border-zinc-800 bg-[#121214] py-3 pl-11 pr-12 text-[14px] text-white placeholder-zinc-500 outline-none transition focus:border-[#34d399]/60 focus:ring-2 focus:ring-[#34d399]/10"
+            placeholder="Название или ID предмета…"
+            className="w-full rounded-xl border border-zinc-800 bg-[#121214] py-3 pl-11 pr-28 text-[14px] text-white placeholder-zinc-500 outline-none transition focus:border-[#34d399]/60 focus:ring-2 focus:ring-[#34d399]/10"
           />
-          {searchLoading ? (
-            <div className="absolute right-4 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin rounded-full border-2 border-zinc-700 border-t-[#34d399]" />
-          ) : (
-            searchQuery.trim() && (
-              <button
-                onClick={() => {
-                  const picked = searchResults[0];
-                  if (picked) selectItem(picked);
-                  else { setShowDropdown(false); void doSearch(searchQuery.trim()); }
-                }}
-                title="Найти и открыть первый результат"
-                className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg bg-[#34d399] px-2.5 py-1 text-[11.5px] font-bold text-black"
-              >
-                Открыть
-              </button>
-            )
-          )}
+          {searchLoading && <div className="absolute right-24 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin rounded-full border-2 border-zinc-700 border-t-[#34d399]" />}
+          <button type="submit" disabled={!searchQuery.trim()} aria-label="Найти предмет"
+            className="absolute right-2 top-1/2 min-h-10 -translate-y-1/2 rounded-lg bg-[#34d399] px-3 text-[12px] font-bold text-black disabled:opacity-40">
+            Найти
+          </button>
+          </form>
           {showDropdown && searchResults.length > 0 && (
             <ul className="absolute left-0 right-0 top-full z-50 mt-2 max-h-[340px] overflow-y-auto rounded-xl border border-zinc-800 bg-[#121214] shadow-2xl anim-fade-up">
               {searchResults.map((item, i) => (
                 <li key={item.id}>
                   <button
+                    type="button"
                     onClick={() => selectItem(item)}
                     onMouseEnter={() => setActiveIdx(i)}
                     className={`flex w-full items-center gap-3 px-3 py-2 text-left transition ${i === activeIdx ? "bg-zinc-800" : "hover:bg-zinc-800/60"}`}
@@ -1667,7 +1761,7 @@ export default function AuctionApp() {
 
             {/* ===== Вкладки ===== */}
             <div className="mt-4 flex flex-wrap items-center gap-2">
-              <div className="flex gap-1 rounded-xl border border-zinc-800 bg-[#101013] p-1">
+              <div className="auction-tabs flex gap-1 rounded-xl border border-zinc-800 bg-[#101013] p-1">
                 <button
                   onClick={() => setActiveTab("lots")}
                   className={`flex items-center gap-1.5 rounded-lg px-4 py-2 text-[13px] font-semibold transition ${activeTab === "lots" ? "bg-zinc-800 text-white" : "text-zinc-500 hover:text-zinc-300"}`}
@@ -1695,7 +1789,7 @@ export default function AuctionApp() {
             {/* ===== Фильтры ===== */}
             {activeTab === "lots" && (
               <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-zinc-800/80 bg-[#101013] p-3">
-                <div className="flex overflow-hidden rounded-lg border border-zinc-800">
+                <div className="upgrade-chips flex max-w-full overflow-x-auto rounded-lg border border-zinc-800">
                   {UPGRADE_CHIPS.map((u) => (
                     <button
                       key={u === null ? "all" : u}
@@ -1718,7 +1812,7 @@ export default function AuctionApp() {
                 </select>
                 <select
                   value={sortOrder}
-                  onChange={(e) => setSortOrder(e.target.value)}
+                  onChange={(e) => { setSortOrder(e.target.value); setPage(1); }}
                   className="rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-[12px] text-zinc-200 outline-none"
                 >
                   <option value="price_asc">Дешевле ↑</option>
@@ -1746,7 +1840,7 @@ export default function AuctionApp() {
 
             {activeTab === "history" && (
               <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-zinc-800/80 bg-[#101013] p-3">
-                <div className="flex overflow-hidden rounded-lg border border-zinc-800">
+                <div className="upgrade-chips flex max-w-full overflow-x-auto rounded-lg border border-zinc-800">
                   {UPGRADE_CHIPS.map((u) => (
                     <button
                       key={u === null ? "all" : u}
@@ -1792,7 +1886,8 @@ export default function AuctionApp() {
             {/* ===== Таблицы ===== */}
             {activeTab === "lots" ? (
               <div className="mt-3 overflow-hidden rounded-2xl border border-zinc-800/80 bg-[#101013]">
-                <div ref={lotListTopRef} className="h-0" />
+                <div ref={lotListTopRef} data-testid="lots-top" className="h-0" />
+                {lotsTotal > lots.length && <p className="px-4 py-2 text-[12px] text-amber-300">Загружено {lots.length} из {lotsTotal} лотов. Фильтры применяются к загруженной части.</p>}
                 {lotsLoading ? (
                   <div className="space-y-2 p-4">
                     {[0, 1, 2, 3, 4].map((i) => <div key={i} className="skeleton h-12 rounded-lg" />)}
@@ -1809,7 +1904,7 @@ export default function AuctionApp() {
                       <span>Цена выкупа</span><span>Редкость</span><span>Заточка</span><span>Осталось</span>
                     </div>
                     {paginatedLots.map((lot) => (
-                      <div key={lot.id} className="grid grid-cols-2 gap-2 border-b border-zinc-800/50 px-4 py-3 transition last:border-0 hover:bg-zinc-900/40 md:grid-cols-[1.4fr_1fr_0.7fr_1fr]">
+                      <div key={lot.id} className="auction-row grid grid-cols-2 gap-2 border-b border-zinc-800/50 px-4 py-3 transition last:border-0 hover:bg-zinc-900/40 md:grid-cols-[1.4fr_1fr_0.7fr_1fr]">
                         <div>
                           <div className="mono text-[14px] font-bold text-white">{formatPrice(lot.buyoutPrice || lot.startPrice)} ₽</div>
                           {lot.amount > 1 && <div className="text-[11px] text-zinc-500">×{lot.amount} · {formatPrice(lot.pricePerUnit || 0)} ₽/шт</div>}
@@ -1825,7 +1920,7 @@ export default function AuctionApp() {
                         </div>
                         <div className="flex items-center">
                           <span className={`mono text-[13px] font-bold ${lot.upgrade > 0 ? "text-emerald-400" : "text-zinc-600"}`}>
-                            {lot.upgrade > 0 ? `+${lot.upgrade}` : "—"}
+                            {lot.upgrade >= 0 ? `+${lot.upgrade}` : "?"}
                           </span>
                         </div>
                         <div className="flex items-center gap-1.5 text-[12px] text-zinc-400">
@@ -1842,18 +1937,18 @@ export default function AuctionApp() {
                     ))}
 
                     {totalPages > 1 && (
-                      <div className="flex items-center justify-center gap-3 border-t border-zinc-800 px-4 py-3 text-[12.5px] text-zinc-400">
+                      <div className="pagination flex items-center justify-center gap-3 border-t border-zinc-800 px-4 py-3 text-[12.5px] text-zinc-400">
                         <button
-                          disabled={page === 1}
-                          onClick={() => gotoLotsPage(Math.max(1, page - 1))}
+                          disabled={currentPage === 1}
+                          onClick={() => gotoLotsPage(Math.max(1, currentPage - 1))}
                           className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                         >
                           <ChevronLeft className="h-3.5 w-3.5" /> Назад
                         </button>
-                        <span>Страница {page} из {totalPages}</span>
+                        <span>{currentPage} / {totalPages}</span>
                         <button
-                          disabled={page === totalPages}
-                          onClick={() => gotoLotsPage(Math.min(totalPages, page + 1))}
+                          disabled={currentPage === totalPages}
+                          onClick={() => gotoLotsPage(Math.min(totalPages, currentPage + 1))}
                           className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                         >
                           Вперёд <ChevronRight className="h-3.5 w-3.5" />
@@ -1867,7 +1962,10 @@ export default function AuctionApp() {
               <div className="mt-3 grid grid-cols-1 gap-4 lg:grid-cols-[1fr_320px]">
                 {/* Левая колонка: Таблица истории */}
                 <div className="overflow-hidden rounded-2xl border border-zinc-800/80 bg-[#101013]">
-                  <div ref={histListTopRef} className="h-0" />
+                  <div ref={histListTopRef} data-testid="history-top" className="h-0" />
+                  {historyError && <p role="alert" className="px-4 py-3 text-[13px] text-amber-300">{historyError}</p>}
+                  {historyTotal > history.length && <p className="px-4 py-2 text-[12px] text-zinc-400">Загружено {history.length} из {historyTotal} продаж. Более старые записи в эту выборку не вошли.</p>}
+                  {history.some((entry) => entry.quality < 0) && <p className="px-4 py-2 text-[12px] text-zinc-400">Для части продаж EXBO не передал редкость. Они отмечены как «Неизвестна».</p>}
                   {historyLoading && !historyLoaded ? (
                     <div className="space-y-2 p-4">
                       {[0, 1, 2, 3, 4].map((i) => <div key={i} className="skeleton h-12 rounded-lg" />)}
@@ -1876,7 +1974,7 @@ export default function AuctionApp() {
                     <div className="px-4 py-12 text-center">
                       <HistoryIcon className="mx-auto h-8 w-8 text-zinc-700" />
                       <p className="mt-2 text-[14px] font-medium text-zinc-400">История отсутствует</p>
-                      <p className="mt-1 text-[12px] text-zinc-600">По этому предмету пока не было продаж в регионе {region}</p>
+                      <p className="mt-1 text-[12px] text-zinc-600">В загруженной истории нет записей по выбранным фильтрам. Попробуйте другой период или редкость.</p>
                     </div>
                   ) : (
                     <>
@@ -1884,7 +1982,7 @@ export default function AuctionApp() {
                         <span>Цена продажи</span><span>Редкость</span><span>Заточка</span><span>Дата</span>
                       </div>
                       {paginatedHistory.map((h) => (
-                        <div key={h.id} className="grid grid-cols-2 gap-2 border-b border-zinc-800/50 px-4 py-3 transition last:border-0 hover:bg-zinc-900/40 md:grid-cols-[1.4fr_1fr_0.7fr_1fr]">
+                        <div key={h.id} className="auction-row grid grid-cols-2 gap-2 border-b border-zinc-800/50 px-4 py-3 transition last:border-0 hover:bg-zinc-900/40 md:grid-cols-[1.4fr_1fr_0.7fr_1fr]">
                           <div className="mono text-[14px] font-bold text-white">{formatPrice(h.price)} ₽</div>
                           <div className="flex items-center">
                             <span
@@ -1897,7 +1995,7 @@ export default function AuctionApp() {
                           </div>
                           <div className="flex items-center">
                             <span className={`mono text-[13px] font-bold ${h.upgrade > 0 ? "text-emerald-400" : "text-zinc-600"}`}>
-                              {h.upgrade > 0 ? `+${h.upgrade}` : "—"}
+                              {h.upgrade >= 0 ? `+${h.upgrade}` : "?"}
                             </span>
                           </div>
                           <div className="flex items-center gap-1.5 text-[12px] text-zinc-400">📅 {formatDate(h.time)}</div>
@@ -1905,18 +2003,18 @@ export default function AuctionApp() {
                       ))}
 
                       {totalHistoryPages > 1 && (
-                        <div className="flex items-center justify-center gap-3 border-t border-zinc-800 px-4 py-3 text-[12.5px] text-zinc-400">
+                        <div className="pagination flex items-center justify-center gap-3 border-t border-zinc-800 px-4 py-3 text-[12.5px] text-zinc-400">
                           <button
-                            disabled={historyPage === 1}
-                            onClick={() => gotoHistoryPage(Math.max(1, historyPage - 1))}
+                            disabled={currentHistoryPage === 1}
+                            onClick={() => gotoHistoryPage(Math.max(1, currentHistoryPage - 1))}
                             className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                           >
                             <ChevronLeft className="h-3.5 w-3.5" /> Назад
                           </button>
-                          <span>Страница {historyPage} из {totalHistoryPages}</span>
+                          <span>{currentHistoryPage} / {totalHistoryPages}</span>
                           <button
-                            disabled={historyPage === totalHistoryPages}
-                            onClick={() => gotoHistoryPage(Math.min(totalHistoryPages, historyPage + 1))}
+                            disabled={currentHistoryPage === totalHistoryPages}
+                            onClick={() => gotoHistoryPage(Math.min(totalHistoryPages, currentHistoryPage + 1))}
                             className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                           >
                             Вперёд <ChevronRight className="h-3.5 w-3.5" />
@@ -1990,7 +2088,7 @@ export default function AuctionApp() {
 
             <div className="mt-4 flex flex-col gap-4 lg:flex-row">
               {/* Категории */}
-              <aside className="w-full shrink-0 lg:w-60">
+              <aside className="catalog-categories w-full shrink-0 lg:w-60">
                 <div className="rounded-2xl border border-zinc-800/80 bg-[#101013] p-2">
                   <button
                     onClick={() => { setCatalogCategory("all"); setCatalogPage(1); }}
@@ -2015,7 +2113,16 @@ export default function AuctionApp() {
               </aside>
 
               {/* Сетка */}
-              <div className="min-w-0 flex-1">
+              <div ref={catalogListTopRef} data-testid="catalog-top" className="min-w-0 flex-1">
+                <label className="mb-3 block text-[13px] text-zinc-400 lg:hidden">
+                  Категория
+                  <select aria-label="Категория каталога" value={catalogCategory}
+                    onChange={(event) => { setCatalogCategory(event.target.value); setCatalogPage(1); }}
+                    className="mt-1 w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-3 text-white">
+                    <option value="all">Все предметы</option>
+                    {categories.map((entry) => <option key={entry.category} value={entry.category}>{categoryLabel(entry.category)} ({entry.count})</option>)}
+                  </select>
+                </label>
                 <div className="relative">
                   <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
                   <input
@@ -2089,10 +2196,10 @@ export default function AuctionApp() {
                       ))}
                     </div>
                     {catalogTotalPages > 1 && (
-                      <div className="mt-4 flex items-center justify-center gap-3 text-[12.5px] text-zinc-400">
+                      <div className="pagination mt-4 flex items-center justify-center gap-3 text-[12.5px] text-zinc-400">
                         <button
                           disabled={catalogPage === 1}
-                          onClick={() => setCatalogPage((p) => Math.max(1, p - 1))}
+                          onClick={() => gotoCatalogPage(Math.max(1, catalogPage - 1))}
                           className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                         >
                           ← Назад
@@ -2100,7 +2207,7 @@ export default function AuctionApp() {
                         <span>{catalogPage} / {catalogTotalPages}</span>
                         <button
                           disabled={catalogPage === catalogTotalPages}
-                          onClick={() => setCatalogPage((p) => Math.min(catalogTotalPages, p + 1))}
+                          onClick={() => gotoCatalogPage(Math.min(catalogTotalPages, catalogPage + 1))}
                           className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-zinc-200 disabled:opacity-40"
                         >
                           Вперёд →
@@ -2135,7 +2242,7 @@ export default function AuctionApp() {
                 {isAdmin && (
                   <button
                     onClick={() => checkTrackers(false)}
-                    disabled={checking || trackers.length === 0}
+                    disabled={checking || (trackers.length === 0 && sellTrackers.every((entry) => entry.status !== "active"))}
                     className="flex items-center gap-1.5 rounded-xl border border-zinc-700 bg-zinc-800 px-4 py-2 text-[13px] font-semibold text-white hover:bg-zinc-700 disabled:opacity-50"
                   >
                     <RefreshCw className={`h-3.5 w-3.5 ${checking ? "animate-spin" : ""}`} />
@@ -2193,7 +2300,7 @@ export default function AuctionApp() {
                               .then((d) => { if (d.success) selectItem(d.item); })
                               .catch(() => selectItem({ id: t.itemId, nameRu: t.itemName, iconUrl: t.itemIcon || undefined }));
                           }}
-                          className="flex items-center gap-1 truncate text-[14px] font-semibold text-white hover:text-[#34d399]"
+                          className="flex max-w-full items-center gap-1 truncate text-[14px] font-semibold text-white hover:text-[#34d399]"
                         >
                           {t.itemName} <ExternalLink className="h-3 w-3 shrink-0" />
                         </button>
@@ -2203,7 +2310,7 @@ export default function AuctionApp() {
                             {t.upgradeMode === "any" ? "любая заточка" : t.upgradeMode === "min" ? `от +${t.targetUpgrade}` : `+${t.targetUpgrade}`}
                           </span>
                           <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300">
-                            {t.targetQuality === -1 ? "любая редкость" : QUALITY_NAMES[t.targetQuality]}
+                            {t.targetQuality === -1 ? "любая редкость" : `${QUALITY_NAMES[t.targetQuality]}${t.qualityMode === "min" ? " и выше" : ""}`}
                           </span>
                           <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300">
                             {trackerPriceLabel(t)}
@@ -2287,7 +2394,7 @@ export default function AuctionApp() {
                                 .then((d) => { if (d.success) selectItem(d.item); })
                                 .catch(() => selectItem({ id: s.itemId, nameRu: s.itemName, iconUrl: s.itemIcon || undefined }));
                             }}
-                            className="flex items-center gap-1 truncate text-[14px] font-semibold text-white hover:text-[#34d399]"
+                            className="flex max-w-full items-center gap-1 truncate text-[14px] font-semibold text-white hover:text-[#34d399]"
                           >
                             {s.itemName} <ExternalLink className="h-3 w-3 shrink-0" />
                           </button>
@@ -2304,7 +2411,7 @@ export default function AuctionApp() {
                             {s.status === "active" ? (
                               <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-300">
                                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 live-dot" />
-                                На продаже{s.expectedEndTime ? ` · до ${formatDate(s.expectedEndTime)}` : ""}
+                                {s.firstMissingAt ? "Уточняем результат" : "На продаже"}{s.expectedEndTime ? ` · до ${formatDate(s.expectedEndTime)}` : ""}
                               </span>
                             ) : s.status === "sold" ? (
                               <span className="inline-flex items-center gap-1.5 rounded-full border border-[#34d399]/30 bg-[#34d399]/10 px-2.5 py-0.5 text-[11px] font-semibold text-[#34d399]">
@@ -2312,10 +2419,11 @@ export default function AuctionApp() {
                               </span>
                             ) : (
                               <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-semibold text-amber-300">
-                                <Clock className="h-3 w-3" /> Срок истёк{s.finishedAt ? ` · ${formatDate(s.finishedAt)}` : ""}
+                                <Clock className="h-3 w-3" /> {s.status === "removed" ? "Лот исчез — проверьте в игре" : "Срок истёк"}{s.finishedAt ? ` · ${formatDate(s.finishedAt)}` : ""}
                               </span>
                             )}
                           </div>
+                          {s.lastError && <p className="mt-2 text-[12px] text-amber-300">{s.lastError}</p>}
                           <div className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
                             <Send className="h-3 w-3 shrink-0 text-sky-500" />
                             {myTg?.linked ? (
@@ -2879,9 +2987,10 @@ export default function AuctionApp() {
 
       {/* ===== Модалка трекера ===== */}
       {showTrackerModal && (
-        <div className="fixed inset-0 z-[100] grid place-items-center bg-black/70 p-4 backdrop-blur-sm" onClick={() => setShowTrackerModal(false)}>
+        <div className="modal-overlay fixed inset-0 z-[100] grid place-items-center overflow-y-auto bg-black/70 p-3 backdrop-blur-sm" onClick={() => setShowTrackerModal(false)}>
           <div
-            className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#121214] p-5 shadow-2xl anim-fade-up"
+            role="dialog" aria-modal="true" aria-label="Настройка слежки"
+            className="modal-panel w-full max-w-md overflow-y-auto rounded-2xl border border-zinc-800 bg-[#121214] p-4 sm:p-5 shadow-2xl anim-fade-up"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-start justify-between">
@@ -2890,7 +2999,7 @@ export default function AuctionApp() {
                 <img src={itemIcon(selectedItem)} alt="" onError={(e) => { (e.target as HTMLImageElement).src = FALLBACK_ICON; }} className="h-10 w-10 rounded-lg border border-zinc-800 bg-zinc-900 object-contain p-1" />
                 <div>
                   <h2 className="text-[15px] font-bold text-white">🎯 Новый трекер</h2>
-                  <p className="max-w-[240px] truncate text-[12px] text-zinc-500">{itemName(selectedItem)} · {region}</p>
+                  <p className="max-w-[180px] truncate text-[12px] text-zinc-500">{itemName(selectedItem)} · {region}</p>
                 </div>
               </div>
               <button onClick={() => setShowTrackerModal(false)} className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-white">
@@ -2913,6 +3022,18 @@ export default function AuctionApp() {
                       className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${trackerForm.upgradeMode === o.v ? "bg-[#34d399] text-black" : "text-zinc-400 hover:text-white"}`}
                     >
                       {o.t}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-1 block text-[12px] font-medium text-zinc-400">Режим редкости</label>
+                <div className="grid grid-cols-2 gap-1 rounded-xl border border-zinc-800 bg-zinc-900/50 p-1">
+                  {[{ value: "exact", label: "Точно" }, { value: "min", label: "От и выше" }].map((mode) => (
+                    <button key={mode.value} type="button" onClick={() => setTrackerForm((form) => ({ ...form, qualityMode: mode.value }))}
+                      className={`rounded-lg px-2 py-2 text-[12.5px] font-medium ${trackerForm.qualityMode === mode.value ? "bg-[#34d399] text-black" : "text-zinc-400"}`}>
+                      {mode.label}
                     </button>
                   ))}
                 </div>
@@ -2991,8 +3112,8 @@ export default function AuctionApp() {
             </div>
 
             <div className="mt-4 flex gap-2">
-              <button onClick={saveTracker} className="flex-1 rounded-xl bg-[#34d399] py-2.5 text-[13.5px] font-bold text-black hover:brightness-110">
-                Запустить слежку
+              <button onClick={saveTracker} disabled={trackerSaving} className="flex-1 rounded-xl bg-[#34d399] py-2.5 text-[13.5px] font-bold text-black hover:brightness-110">
+                {trackerSaving ? "Сохраняю…" : "Запустить слежку"}
               </button>
               <button onClick={() => setShowTrackerModal(false)} className="rounded-xl bg-zinc-800 px-5 py-2.5 text-[13.5px] font-medium text-zinc-300 hover:bg-zinc-700">
                 Отмена
@@ -3004,9 +3125,10 @@ export default function AuctionApp() {
 
       {/* ===== Модалка привязки продажи ===== */}
       {sellLot && selectedItem && (
-        <div className="fixed inset-0 z-[100] grid place-items-center bg-black/70 p-4 backdrop-blur-sm" onClick={() => setSellLot(null)}>
+        <div className="modal-overlay fixed inset-0 z-[100] grid place-items-center overflow-y-auto bg-black/70 p-3 backdrop-blur-sm" onClick={() => setSellLot(null)}>
           <div
-            className="w-full max-w-md rounded-2xl border border-zinc-800 bg-[#121214] p-5 shadow-2xl anim-fade-up"
+            role="dialog" aria-modal="true" aria-label="Настройка слежки"
+            className="modal-panel w-full max-w-md overflow-y-auto rounded-2xl border border-zinc-800 bg-[#121214] p-4 sm:p-5 shadow-2xl anim-fade-up"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-start justify-between">
@@ -3015,7 +3137,7 @@ export default function AuctionApp() {
                 <img src={itemIcon(selectedItem)} alt="" onError={(e) => { (e.target as HTMLImageElement).src = FALLBACK_ICON; }} className="h-10 w-10 rounded-lg border border-zinc-800 bg-zinc-900 object-contain p-1" />
                 <div>
                   <h2 className="text-[15px] font-bold text-white">💰 Отслеживать продажу</h2>
-                  <p className="max-w-[240px] truncate text-[12px] text-zinc-500">{itemName(selectedItem)} · {region}</p>
+                  <p className="max-w-[180px] truncate text-[12px] text-zinc-500">{itemName(selectedItem)} · {region}</p>
                 </div>
               </div>
               <button onClick={() => setSellLot(null)} className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-white">
@@ -3039,29 +3161,9 @@ export default function AuctionApp() {
               </div>
             </div>
 
-            <div className="mt-3">
-              <label className="mb-1 block text-[12px] font-medium text-zinc-400">
-                Редкость: сообщать о продажах
-              </label>
-              <div className="grid grid-cols-2 gap-1 rounded-xl border border-zinc-800 bg-zinc-900/50 p-1">
-                <button
-                  onClick={() => setSellQualityMode("exact")}
-                  className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${sellQualityMode === "exact" ? "bg-[#34d399] text-black" : "text-zinc-400 hover:text-white"}`}
-                >
-                  Точно {sellLot.qualityName}
-                </button>
-                <button
-                  onClick={() => setSellQualityMode("min")}
-                  className={`rounded-lg px-2 py-1.5 text-[12.5px] font-medium ${sellQualityMode === "min" ? "bg-[#34d399] text-black" : "text-zinc-400 hover:text-white"}`}
-                >
-                  От {sellLot.qualityName} и выше
-                </button>
-              </div>
-            </div>
-
             <p className="mt-3 rounded-xl bg-zinc-900/60 px-3 py-2 text-[11.5px] leading-relaxed text-zinc-500">
               💡 Привяжу именно этот лот — срок окончания возьму из него сам.
-              В Telegram сразу придёт подтверждение, а потом — «продано» или «срок истёк». Сайт можно закрыть.
+              После проверки сообщу результат в привязанный Telegram. Если EXBO не подтвердит продажу, покажу «Лот исчез». Сайт можно закрыть.
             </p>
 
             <div className="mt-4 flex gap-2">

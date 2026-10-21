@@ -18,8 +18,8 @@ import { getSetting } from "./settings";
  *   2. «Адрес сайта» из настроек админки;
  *   3. localhost — крайний случай, пинг есть, но Render его не видит.
  *
- * Сам ping вызывает сам Render: при уснувшем сервисе запрос пробуждает его
- * (холодный старт ~60 с), поэтому сервис получается самовосстанавливающимся.
+ * Таймер работает только пока процесс запущен. Для пробуждения уже
+ * уснувшего сервиса нужен внешний мониторинг или постоянно работающий тариф.
  *
  * РАСХОД БАЗЫ: /api/health не обращается к базе, поэтому самопробуждение
  * не тратит CU-часы Neon.
@@ -143,7 +143,7 @@ async function ping(): Promise<void> {
 
 /** Запустить самопробуждение. Идемпотентно. */
 export function ensureKeepAlive(): boolean {
-  if (state.running) return false;
+  if (state.running || process.env.AUCTRACKER_BACKGROUND === "0") return false;
   state.running = true;
 
   const timer = setInterval(() => {

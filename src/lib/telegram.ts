@@ -1,6 +1,7 @@
 import { db } from "@/db";
 import { telegramChats, trackers, telegramCodes } from "@/db/schema";
-import { and, eq, lt } from "drizzle-orm";
+import { and, eq, gt, lt } from "drizzle-orm";
+import { randomInt } from "node:crypto";
 import { getSetting, setSetting } from "./settings";
 import { invalidateTrackerCache } from "./tracker-check";
 
@@ -22,6 +23,7 @@ async function botApi<T>(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15_000),
     });
     const j = (await r.json()) as {
       ok: boolean;
@@ -112,7 +114,7 @@ export async function createLinkCode(ownerKey: string): Promise<string> {
 
   let code = "";
   for (let i = 0; i < 6; i++) {
-    code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+    code += CODE_CHARS[randomInt(CODE_CHARS.length)];
   }
   await db.insert(telegramCodes).values({ code, ownerKey, createdAt: new Date() });
   return code;
@@ -121,16 +123,10 @@ export async function createLinkCode(ownerKey: string): Promise<string> {
 // Возвращает ownerKey по коду, если код валиден и не просрочен
 async function consumeLinkCode(code: string): Promise<string | null> {
   const [row] = await db
-    .select()
-    .from(telegramCodes)
-    .where(eq(telegramCodes.code, code));
-  if (!row) return null;
-  if (row.createdAt && Date.now() - row.createdAt.getTime() > CODE_TTL_MS) {
-    await db.delete(telegramCodes).where(eq(telegramCodes.code, code));
-    return null;
-  }
-  await db.delete(telegramCodes).where(eq(telegramCodes.code, code));
-  return row.ownerKey;
+    .delete(telegramCodes)
+    .where(and(eq(telegramCodes.code, code), gt(telegramCodes.createdAt, new Date(Date.now() - CODE_TTL_MS))))
+    .returning();
+  return row?.ownerKey ?? null;
 }
 
 interface TgUpdate {
@@ -147,7 +143,7 @@ interface TgUpdate {
 }
 
 // Опрос входящих сообщений бота (без вебхуков — работает на любом хостинге)
-export async function pollTelegramUpdates(): Promise<{
+async function pollUpdates(): Promise<{
   ok: boolean;
   linked: string[];
 }> {
@@ -161,6 +157,7 @@ export async function pollTelegramUpdates(): Promise<{
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ offset, timeout: 0, allowed_updates: ["message"] }),
+      signal: AbortSignal.timeout(15_000),
     });
     const j = (await r.json()) as { ok: boolean; result: TgUpdate[] };
     if (!j.ok) return { ok: false, linked };
@@ -221,6 +218,7 @@ export async function pollTelegramUpdates(): Promise<{
           .update(telegramChats)
           .set({ isActive: false })
           .where(eq(telegramChats.chatId, chatId));
+        invalidateTrackerCache();
         await sendTelegramMessage(
           chatId,
           `🔕 Уведомления отключены.\nЧтобы включить снова — отправьте <code>/start КОД</code> с новым кодом с сайта.`
@@ -260,4 +258,11 @@ export async function pollTelegramUpdates(): Promise<{
     console.error("TG poll failed:", e);
     return { ok: false, linked };
   }
+}
+
+// Кнопка на сайте и фоновый таймер не должны обрабатывать один update дважды.
+let activePoll: ReturnType<typeof pollUpdates> | null = null;
+export function pollTelegramUpdates(): ReturnType<typeof pollUpdates> {
+  if (!activePoll) activePoll = pollUpdates().finally(() => { activePoll = null; });
+  return activePoll;
 }

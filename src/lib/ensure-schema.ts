@@ -212,6 +212,35 @@ export async function ensureSchema(): Promise<void> {
     await db.execute(sql`
       ALTER TABLE sell_trackers ADD COLUMN IF NOT EXISTS quality_mode text NOT NULL DEFAULT 'exact';
     `);
+    await db.execute(sql`
+      ALTER TABLE trackers ADD COLUMN IF NOT EXISTS quality_mode text NOT NULL DEFAULT 'exact';
+    `);
+    await db.execute(sql`
+      ALTER TABLE sell_trackers ADD COLUMN IF NOT EXISTS first_missing_at timestamp,
+        ADD COLUMN IF NOT EXISTS last_checked_at timestamp,
+        ADD COLUMN IF NOT EXISTS last_error text;
+    `);
+    // Денежные суммы на аукционе могут превышать предел PostgreSQL integer.
+    // Меняем тип один раз, сохраняя существующие значения и записи.
+    await db.execute(sql`
+      DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'trackers'
+            AND column_name = 'max_price' AND data_type = 'integer') THEN
+          ALTER TABLE trackers ALTER COLUMN max_price TYPE bigint, ALTER COLUMN min_price TYPE bigint;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'sell_trackers'
+            AND column_name = 'price' AND data_type = 'integer') THEN
+          ALTER TABLE sell_trackers ALTER COLUMN price TYPE bigint, ALTER COLUMN finish_price TYPE bigint;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'notifications'
+            AND column_name = 'price' AND data_type = 'integer') THEN
+          ALTER TABLE notifications ALTER COLUMN price TYPE bigint;
+        END IF;
+      END $$;
+    `);
     done = true;
   })().catch((e) => {
     running = null;

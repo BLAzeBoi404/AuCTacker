@@ -5,6 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { getSetting, setSetting } from "@/lib/settings";
 import { getOwnerKey, isAdmin } from "@/lib/identity";
 import { ensureSchema } from "@/lib/ensure-schema";
+import { invalidateTrackerCache } from "@/lib/tracker-check";
 import {
   getBotToken,
   getBotUsername,
@@ -108,6 +109,7 @@ export async function POST(req: NextRequest) {
         .update(telegramChats)
         .set({ isActive: false })
         .where(eq(telegramChats.ownerKey, owner));
+      invalidateTrackerCache();
       return NextResponse.json({ success: true });
     }
 
@@ -120,19 +122,21 @@ export async function POST(req: NextRequest) {
       if (action === "delete-token") {
         await setSetting("telegram_bot_token", "");
         await setSetting("telegram_bot_username", "");
+        invalidateTrackerCache();
         return NextResponse.json({ success: true });
       }
       const token = (body.token || "").trim();
       if (!token || !token.includes(":")) {
         return NextResponse.json({ success: false, error: "bad_token" });
       }
-      const r = await fetch(`https://api.telegram.org/bot${token}/getMe`, { method: "POST" });
+      const r = await fetch(`https://api.telegram.org/bot${token}/getMe`, { method: "POST", signal: AbortSignal.timeout(15_000) });
       const j = (await r.json()) as { ok: boolean; result?: { username?: string } };
       if (!j.ok || !j.result?.username) {
         return NextResponse.json({ success: false, error: "invalid_token" });
       }
       await setSetting("telegram_bot_token", token);
       await setSetting("telegram_bot_username", j.result.username);
+      invalidateTrackerCache();
       return NextResponse.json({ success: true, botUsername: j.result.username });
     }
 

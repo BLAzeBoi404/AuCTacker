@@ -81,6 +81,8 @@ export async function isAdmin(): Promise<boolean> {
   if (!token) return false;
   const [issuedAt, sig] = token.split(".");
   if (!issuedAt || !sig) return false;
+  const issued = Number(issuedAt);
+  if (!Number.isSafeInteger(issued) || issued > Date.now() || Date.now() - issued > ONE_YEAR * 1000) return false;
   const expected = signAdmin(issuedAt);
   const a = Buffer.from(sig);
   const b = Buffer.from(expected);

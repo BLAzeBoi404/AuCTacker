@@ -64,15 +64,6 @@ export default function PriceChart({
   const [width, setWidth] = useState(0);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
-  useEffect(() => {
-    const el = wrapRef.current;
-    if (!el) return;
-    const update = () => setWidth(Math.floor(el.clientWidth));
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
 
   const model = useMemo(() => {
     const pts: P[] = [];
@@ -136,6 +127,17 @@ export default function PriceChart({
     return { arr, min, max, minIdx, maxIdx, lo, hi, t0, t1, log };
   }, [data]);
 
+  const hasData = model !== null;
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const update = () => setWidth(Math.floor(el.clientWidth));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [hasData]);
+
   const innerW = Math.max(10, width - PAD_L - PAD_R);
   const innerH = Math.max(10, height - PAD_T - PAD_B);
 
@@ -189,16 +191,16 @@ export default function PriceChart({
 
     // Подписи времени
     ctx.fillStyle = "#5b5b63";
-    ctx.textAlign = "center";
-    for (let i = 0; i <= 4; i++) {
-      const t = model.t0 + ((model.t1 - model.t0) * i) / 4;
+    const sameDay = new Date(model.t0).toDateString() === new Date(model.t1).toDateString();
+    const timeTicks = Math.max(1, Math.min(4, Math.floor(innerW / (sameDay ? 60 : 110))));
+    for (let i = 0; i <= timeTicks; i++) {
+      const t = model.t0 + ((model.t1 - model.t0) * i) / timeTicks;
       const dt = new Date(t);
-      const sameDay = new Date(model.t0).toDateString() === new Date(model.t1).toDateString();
       const label = sameDay
         ? dt.toLocaleString("ru-RU", { hour: "2-digit", minute: "2-digit" })
         : dt.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
-      const cx = Math.min(Math.max(xOf(t), PAD_L + 24), width - PAD_R - 24);
-      ctx.fillText(label, cx, height - 8);
+      ctx.textAlign = i === 0 ? "left" : i === timeTicks ? "right" : "center";
+      ctx.fillText(label, xOf(t), height - 8);
     }
 
     // Заливка
@@ -283,7 +285,7 @@ export default function PriceChart({
 
   if (!model) {
     return (
-      <div className="grid h-[240px] place-items-center text-center">
+      <div ref={wrapRef} className="grid h-[240px] place-items-center text-center">
         <div>
           <p className="text-[13.5px] font-medium text-zinc-400">Нет данных за выбранный период</p>
           <p className="mt-1 text-[12px] text-zinc-600">Попробуйте другой период или регион</p>

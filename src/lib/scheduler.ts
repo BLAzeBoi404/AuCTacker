@@ -46,7 +46,7 @@ async function tick() {
 }
 
 export async function ensureScheduler() {
-  if (started) return;
+  if (started || process.env.AUCTRACKER_BACKGROUND === "0") return;
   started = true;
   timer = setTimeout(tick, 5000); // небольшая задержка после старта сервера
   timer.unref?.();

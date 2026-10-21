@@ -1,11 +1,13 @@
 import { db } from "@/db";
 import { trackers, notifications, sellTrackers } from "@/db/schema";
 import { and, asc, eq, gt, isNull, lte, sql } from "drizzle-orm";
-import { ExboApiError, fetchHistoryAll, fetchLotsAll, type NormalizedLot } from "./exbo";
+import { fetchHistoryAll, fetchLotsAll, type NormalizedLot } from "./exbo";
 import { QUALITY_NAMES } from "./constants";
 import { getSetting } from "./settings";
 import { getActiveChats, sendTelegramMessage, esc } from "./telegram";
 import { invalidateAll } from "./user-cache";
+import { buyLotMatches, sellLotMatches, decideMissingSale, SALE_GRACE_MS } from "./tracker-rules";
+import { ensureSchema } from "./ensure-schema";
 
 export interface CheckMatch {
   trackerId: number;
@@ -81,9 +83,13 @@ interface EcoState {
 let state: EcoState | null = null;
 let activeCheck: Promise<CheckResult> | null = null;
 let hasPendingDeliveries = false;
+let nextDeliveryAt = 0;
+let stateVersion = 0;
 
 /** Отложенные записи: копятся в памяти, уходят в базу одной пачкой */
 interface PendingWrite {
+  matchCount?: number;
+  lastMatchedAt?: Date | null;
   lastSeenLotIds: string[];
   /** null — трекер ещё ни разу не проверялся успешно (базовый снимок не снят) */
   lastCheckedAt: Date | null;
@@ -94,15 +100,16 @@ interface PendingWrite {
 const pending = new Map<number, PendingWrite>();
 
 /** Отложенные отметки продаж: last_seen_at + miss_count без пробуждения базы */
-interface PendingSellWrite {
-  lastSeenAt: Date;
-  missCount: number;
-}
+type PendingSellWrite = Partial<Pick<SellTrackerRow,
+  "lastSeenAt" | "missCount" | "firstMissingAt" | "lastCheckedAt" | "lastError"
+  | "targetLotId" | "expectedEndTime" | "startTime" | "quality" | "upgrade" | "price" | "amount" | "qualityName"
+>>;
 const pendingSell = new Map<number, PendingSellWrite>();
 
 /** Сбросить кэш — вызывается при создании/изменении/удалении трекера */
 export function invalidateTrackerCache(): void {
   state = null;
+  stateVersion++;
 }
 
 function priceLabel(min: number, max: number): string {
@@ -121,6 +128,7 @@ async function flushPending(): Promise<boolean> {
     for (const [id, w] of entries) {
       try {
         await db.update(trackers).set({
+          ...w,
           lastSeenLotIds: w.lastSeenLotIds.slice(0, 2000),
           lastCheckedAt: w.lastCheckedAt,
           lastResultCount: w.lastResultCount,
@@ -129,6 +137,7 @@ async function flushPending(): Promise<boolean> {
         }).where(eq(trackers.id, id));
         wrote = true;
       } catch (e) {
+        if (!pending.has(id)) pending.set(id, w);
         console.error("flushPending failed for tracker", id, e);
       }
     }
@@ -138,12 +147,10 @@ async function flushPending(): Promise<boolean> {
     pendingSell.clear();
     for (const [id, w] of entries) {
       try {
-        await db.update(sellTrackers).set({
-          lastSeenAt: w.lastSeenAt,
-          missCount: w.missCount,
-        }).where(eq(sellTrackers.id, id));
+        await db.update(sellTrackers).set(w).where(and(eq(sellTrackers.id, id), eq(sellTrackers.status, "active")));
         wrote = true;
       } catch (e) {
+        if (!pendingSell.has(id)) pendingSell.set(id, w);
         console.error("flushPending failed for sell tracker", id, e);
       }
     }
@@ -152,6 +159,7 @@ async function flushPending(): Promise<boolean> {
 }
 
 async function loadState(): Promise<EcoState> {
+  await ensureSchema();
   await flushPending();
   const [rows, sellRows] = await Promise.all([
     db.select().from(trackers),
@@ -167,13 +175,19 @@ async function loadState(): Promise<EcoState> {
   // Раз в цикл синхронизации подчищаем историю уведомлений
   try {
     await db.execute(
-      sql`delete from notifications where id not in (select id from notifications order by created_at desc limit 300)`
+      sql`delete from notifications where id in (
+        select id from (
+          select id, row_number() over (partition by owner_key order by created_at desc, id desc) as position
+          from notifications where sent_at is not null
+        ) old where position > 300
+      )`
     );
   } catch {
     /* очистка не должна ломать проверку */
   }
 
   hasPendingDeliveries = true; // после перезапуска проверим неотправленные
+  nextDeliveryAt = 0;
   return {
     trackers: rows,
     sellTrackers: sellRows,
@@ -195,12 +209,8 @@ export function getRuntimeConfig(): { enabled: boolean; checkIntervalMs: number 
   };
 }
 
-async function fetchAllLots(itemId: string, region: string): Promise<{ lots: NormalizedLot[]; total: number }> {
-  const { lots, total } = await fetchLotsAll(itemId, region, 2000);
-  if (total > lots.length && lots.length < 2000) {
-    throw new ExboApiError(`EXBO сообщил ${total} лотов, но удалось получить только ${lots.length}`, 502);
-  }
-  return { lots, total };
+async function fetchAllLots(itemId: string, region: string) {
+  return fetchLotsAll(itemId, region, 2000);
 }
 
 /** Дослать уведомления, которые не ушли с первой попытки */
@@ -212,7 +222,11 @@ async function deliverPending(chats: ChatRow[], siteUrl: string): Promise<number
   )).orderBy(asc(notifications.id)).limit(20);
 
   if (rows.length === 0) {
-    hasPendingDeliveries = false;
+    const [waiting] = await db.select({ retryAt: notifications.retryAt }).from(notifications).where(and(
+      isNull(notifications.sentAt), gt(notifications.createdAt, new Date(Date.now() - 86_400_000)),
+    )).orderBy(asc(notifications.retryAt)).limit(1);
+    hasPendingDeliveries = !!waiting;
+    nextDeliveryAt = waiting?.retryAt?.getTime() ?? 0;
     return 0;
   }
 
@@ -222,7 +236,7 @@ async function deliverPending(chats: ChatRow[], siteUrl: string): Promise<number
     // Если адресатов нет — помечаем как доставленное и больше не трогаем.
     const requested = Array.isArray(notification.targetChatIds)
       ? notification.targetChatIds.filter((chatId) =>
-          chats.some((chat) => chat.chatId === chatId),
+          chats.some((chat) => chat.chatId === chatId && chat.ownerKey === notification.ownerKey),
         )
       : [];
     const sent = new Set(Array.isArray(notification.sentChatIds) ? notification.sentChatIds : []);
@@ -240,18 +254,22 @@ async function deliverPending(chats: ChatRow[], siteUrl: string): Promise<number
         kind === "sell_sold"
           ? `✅ <b>Предмет продан: ${esc(notification.itemName)}</b>\n\n`
             + `Цена продажи: <b>${notification.price.toLocaleString("ru-RU")} ₽</b>\n`
-            + `${esc(notification.qualityName || "Обычный")} • +${notification.upgrade}\n`
+            + `${esc(notification.qualityName || "Неизвестна")} • ${notification.upgrade >= 0 ? `+${notification.upgrade}` : "заточка неизвестна"}\n`
             + `Регион: ${esc(notification.region)}\n`
             + `Можно забирать деньги с аукциона.`
+          : kind === "sell_removed"
+            ? `ℹ️ <b>Лот исчез: ${esc(notification.itemName)}</b>\n\n`
+              + `Лота больше нет в выдаче аукциона. EXBO не подтвердил продажу. Проверьте результат в игре.\n`
+              + `Регион: ${esc(notification.region)}`
           : kind === "sell_expired"
             ? `⌛ <b>Срок лота истёк: ${esc(notification.itemName)}</b>\n\n`
               + `Цена была: <b>${notification.price.toLocaleString("ru-RU")} ₽</b>\n`
-              + `${esc(notification.qualityName || "Обычный")} • +${notification.upgrade}\n`
+              + `${esc(notification.qualityName || "Неизвестна")} • ${notification.upgrade >= 0 ? `+${notification.upgrade}` : "заточка неизвестна"}\n`
               + `Регион: ${esc(notification.region)}\n`
-              + `Лот пропал из аукциона после окончания срока. Заберите предмет обратно.`
+              + `Срок лота прошёл; подтверждение продажи в доступной истории не найдено. Проверьте аукцион в игре.`
             : `🎯 <b>Новый лот: ${esc(notification.itemName)}</b>\n\n`
               + `Цена: <b>${notification.price.toLocaleString("ru-RU")} ₽</b>\n`
-              + `${esc(notification.qualityName || "Обычный")} • +${notification.upgrade}\n`
+              + `${esc(notification.qualityName || "Неизвестна")} • ${notification.upgrade >= 0 ? `+${notification.upgrade}` : "заточка неизвестна"}\n`
               + `Регион: ${esc(notification.region)}\n`
               + `Источник: EXBO EAPI`;
       if (await sendTelegramMessage(chatId, html, url)) {
@@ -278,40 +296,6 @@ async function deliverPending(chats: ChatRow[], siteUrl: string): Promise<number
   return delivered;
 }
 
-/** Отпечаток лота продажи для поиска среди активных лотов */
-function sellLotMatches(
-  lot: NormalizedLot,
-  s: {
-    targetLotId: string | null;
-    price: number;
-    amount: number;
-    upgrade: number;
-    quality: number;
-    qualityMode: string;
-    expectedEndTime: Date | null;
-  },
-): boolean {
-  if (s.targetLotId && lot.id === s.targetLotId) return true;
-  const price = lot.buyoutPrice || lot.startPrice || 0;
-  // Заточка и количество — строго как у лота пользователя.
-  // Редкость: "exact" — только совпадение, "min" — выбранная и выше
-  // (например, выбрал «Редкий» → прислали и «Исключительный», и «Легендарный»).
-  const qualityOk =
-    s.qualityMode === "min" ? lot.quality >= s.quality : lot.quality === s.quality;
-  if (
-    price !== s.price ||
-    lot.amount !== s.amount ||
-    lot.upgrade !== s.upgrade ||
-    !qualityOk
-  ) {
-    return false;
-  }
-  if (s.expectedEndTime && lot.endTime) {
-    return Math.abs(new Date(lot.endTime).getTime() - s.expectedEndTime.getTime()) < 120_000;
-  }
-  return true;
-}
-
 async function check(source: string): Promise<CheckResult> {
   const result: CheckResult = {
     checked: 0,
@@ -332,13 +316,14 @@ async function check(source: string): Promise<CheckResult> {
   // 1. Состояние: из памяти или из базы (редко)
   let current = state;
   if (!current || Date.now() - current.loadedAt > current.syncMs) {
+    const version = stateVersion;
     current = await loadState();
-    state = current;
+    if (version === stateVersion) state = current;
     result.dbTouched = true;
   }
   result.stateAgeSec = Math.round((Date.now() - current.loadedAt) / 1000);
 
-  if (!current.schedulerEnabled && source === "scheduler") return result;
+  if (!current.schedulerEnabled && source !== "manual") return result;
 
   const chatsByOwner = new Map<string, ChatRow[]>();
   for (const chat of current.chats) {
@@ -346,62 +331,12 @@ async function check(source: string): Promise<CheckResult> {
     chatsByOwner.set(chat.ownerKey, [...(chatsByOwner.get(chat.ownerKey) || []), chat]);
   }
 
-  const now = Date.now();
-
-  // 0. Зависшие продажи: если «лот уже должен был закончиться», но мы всё ещё
-  // не видим ни лота, ни признаков продажи — закрываем как истёкший.
-  // Без этого забытый лот висел в «Продаю» бесконечно, пока его не удалишь.
-  for (const sell of current.sellTrackers.filter((s) => s.status === "active")) {
-    const endTs = sell.expectedEndTime ? new Date(sell.expectedEndTime).getTime() : null;
-    if (endTs === null) continue;
-    const grace = 15 * 60_000; // ждём лаг EAPI + 2 промаха подряд
-    if (now < endTs + grace) continue;
-    const misses = (sell.missCount ?? 0) + 1;
-    await db.update(sellTrackers).set({
-      status: "expired",
-      finishedAt: new Date(endTs),
-      finishPrice: sell.price,
-      missCount: misses,
-    }).where(eq(sellTrackers.id, sell.id));
-    sell.status = "expired";
-    sell.finishedAt = new Date(endTs);
-    sell.missCount = misses;
-    result.sellExpired++;
-    result.dbTouched = true;
-    invalidateAll();
-    try {
-      const targets = sell.ownerKey ? (chatsByOwner.get(sell.ownerKey) || []) : [];
-      const qn = sell.qualityName || QUALITY_NAMES[sell.quality ?? 0] || "Обычный";
-      await db.insert(notifications).values({
-        kind: "sell_expired",
-        ownerKey: sell.ownerKey,
-        itemId: sell.itemId,
-        itemName: sell.itemName,
-        itemIcon: sell.itemIcon,
-        region: sell.region,
-        lotId: sell.targetLotId,
-        price: sell.price,
-        upgrade: sell.upgrade ?? 0,
-        quality: sell.quality ?? 0,
-        qualityName: qn,
-        message: `Срок истёк, лот пропал из аукциона`,
-        targetChatIds: targets.map((c) => c.chatId),
-        sentChatIds: [],
-        retryAt: new Date(),
-      }).onConflictDoNothing();
-      hasPendingDeliveries = true;
-    } catch {
-      /* уведомление вторично — статус уже сохранён */
-    }
-  }
-
   const enabled = current.trackers.filter((tracker) => tracker.enabled);
   const activeSell = current.sellTrackers.filter((s) => s.status === "active");
-  if (!enabled.length && !activeSell.length) return result;
 
   // Снимки аукциона кэшируем в пределах одного цикла: один предмет+регион —
   // один набор запросов к EXBO, сколько бы трекеров (покупки + продажи) его ни смотрели
-  const snapshots = new Map<string, { lots: NormalizedLot[]; total: number }>();
+  const snapshots = new Map<string, Awaited<ReturnType<typeof fetchAllLots>>>();
   async function getSnapshot(region: string, itemId: string) {
     const k = `${region}|${itemId}`;
     const hit = snapshots.get(k);
@@ -456,16 +391,7 @@ async function check(source: string): Promise<CheckResult> {
       // и пересоздать его — новый будет привязан к его профилю автоматически.
       const targets = tracker.ownerKey ? (chatsByOwner.get(tracker.ownerKey) || []) : [];
 
-      const matching = snapshot.lots.filter((lot) => {
-        const price = lot.buyoutPrice || lot.startPrice || 0;
-        const upgradeMatches = tracker.upgradeMode === "any"
-          || (tracker.upgradeMode === "exact" && lot.upgrade === tracker.targetUpgrade)
-          || (tracker.upgradeMode === "min" && lot.upgrade >= tracker.targetUpgrade);
-        return upgradeMatches
-          && (tracker.targetQuality === -1 || lot.quality === tracker.targetQuality)
-          && (tracker.maxPrice === 0 || (price > 0 && price <= tracker.maxPrice))
-          && (tracker.minPrice === 0 || (price > 0 && price >= tracker.minPrice));
-      });
+      const matching = snapshot.lots.filter((lot) => buyLotMatches(lot, tracker));
 
       result.checked++;
       result.totalMatches += matching.length;
@@ -474,7 +400,7 @@ async function check(source: string): Promise<CheckResult> {
       // Стартовый отчёт — один раз на трекер
       let reportSent = tracker.initialReportSent;
       if (!reportSent && targets.length) {
-        const quality = tracker.targetQuality === -1 ? "любая редкость" : QUALITY_NAMES[tracker.targetQuality];
+        const quality = tracker.targetQuality === -1 ? "любая редкость" : `${QUALITY_NAMES[tracker.targetQuality]}${tracker.qualityMode === "min" ? " и выше" : ""}`;
         const upgrade = tracker.upgradeMode === "any"
           ? "любая заточка"
           : tracker.upgradeMode === "min"
@@ -495,9 +421,9 @@ async function check(source: string): Promise<CheckResult> {
           }
         }
         if (reportSent) {
-          tracker.initialReportSent = true;
           try {
             await db.update(trackers).set({ initialReportSent: true }).where(eq(trackers.id, tracker.id));
+            tracker.initialReportSent = true;
             result.dbTouched = true;
           } catch { /* повторим в следующий раз */ }
         }
@@ -505,9 +431,10 @@ async function check(source: string): Promise<CheckResult> {
 
       // 3. Новые лоты — единственный случай, когда база нужна немедленно
       let newCount = 0;
+      const failedIds = new Set<string>();
       if (!firstRun) {
         for (const lot of matching) {
-          if (seen.has(lot.id)) continue;
+          if (seen.has(lot.id) || (lot.legacyId && seen.has(lot.legacyId))) continue;
           const price = lot.buyoutPrice || lot.startPrice || 0;
           const match: CheckMatch = {
             trackerId: tracker.id,
@@ -519,15 +446,12 @@ async function check(source: string): Promise<CheckResult> {
             price,
             upgrade: lot.upgrade,
             quality: lot.quality,
-            qualityName: QUALITY_NAMES[lot.quality] || "Обычный",
+            qualityName: QUALITY_NAMES[lot.quality] || "Неизвестна",
             endTime: lot.endTime,
             isNew: true,
           };
-          result.matches.push(match);
-          newCount++;
-
           try {
-            await db.insert(notifications).values({
+            const inserted = await db.insert(notifications).values({
               kind: "buy",
               ownerKey: tracker.ownerKey,
               trackerId: tracker.id,
@@ -540,46 +464,56 @@ async function check(source: string): Promise<CheckResult> {
               upgrade: lot.upgrade,
               quality: lot.quality,
               qualityName: match.qualityName,
-              message: `+${lot.upgrade} • ${match.qualityName} • ${price.toLocaleString("ru-RU")} ₽`,
+              message: `${lot.upgrade >= 0 ? `+${lot.upgrade}` : "заточка неизвестна"} • ${match.qualityName} • ${price.toLocaleString("ru-RU")} ₽`,
               targetChatIds: targets.map((target) => target.chatId),
               sentChatIds: [],
               retryAt: new Date(),
-            }).onConflictDoNothing();
+            }).onConflictDoNothing().returning({ id: notifications.id });
+            if (inserted.length) { result.matches.push(match); newCount++; }
             result.dbTouched = true;
             hasPendingDeliveries = true;
+            nextDeliveryAt = 0;
             invalidateAll(); // у пользователя появилось новое уведомление
           } catch (e) {
+            failedIds.add(lot.id);
             console.error("notification insert failed:", e);
           }
         }
       }
 
       // Обновляем состояние в памяти
-      tracker.lastSeenLotIds = currentIds.slice(0, 2000);
+      tracker.lastSeenLotIds = [...new Set([...seen, ...currentIds])].filter((id) => !failedIds.has(id)).slice(-2000);
       tracker.lastCheckedAt = new Date();
       tracker.lastResultCount = matching.length;
       tracker.lastApiTotal = snapshot.total;
-      tracker.lastError = null;
+      tracker.lastError = failedIds.size ? "Не удалось сохранить часть уведомлений. Повторим проверку." : null;
+      if (failedIds.size) result.failed++;
       if (newCount) {
         tracker.matchCount += newCount;
         tracker.lastMatchedAt = new Date();
       }
 
-      if (newCount) {
-        // Есть новые лоты — сохраняем сразу, чтобы после перезапуска не задвоить
+      if (firstRun || newCount) {
+        // Начальный снимок тоже сохраняем: перезапуск не должен заново
+        // инициализировать трекер и пропускать появившиеся за это время лоты.
         try {
           await db.update(trackers).set({
             lastSeenLotIds: tracker.lastSeenLotIds,
             lastCheckedAt: tracker.lastCheckedAt,
             lastResultCount: tracker.lastResultCount,
             lastApiTotal: tracker.lastApiTotal,
-            lastError: null,
+            lastError: tracker.lastError,
             matchCount: tracker.matchCount,
             lastMatchedAt: tracker.lastMatchedAt,
           }).where(eq(trackers.id, tracker.id));
           pending.delete(tracker.id);
           result.dbTouched = true;
         } catch (e) {
+          pending.set(tracker.id, {
+            lastSeenLotIds: tracker.lastSeenLotIds, lastCheckedAt: tracker.lastCheckedAt,
+            lastResultCount: tracker.lastResultCount, lastApiTotal: tracker.lastApiTotal,
+            lastError: tracker.lastError, matchCount: tracker.matchCount, lastMatchedAt: tracker.lastMatchedAt,
+          });
           console.error("tracker update failed:", e);
         }
       } else {
@@ -589,123 +523,121 @@ async function check(source: string): Promise<CheckResult> {
           lastCheckedAt: tracker.lastCheckedAt,
           lastResultCount: tracker.lastResultCount,
           lastApiTotal: tracker.lastApiTotal,
-          lastError: null,
+          lastError: tracker.lastError,
         });
       }
     }
   }
 
-  // 4. Трекеры ПРОДАЖ: следим, что наш лот всё ещё на аукционе
-  result.sellChecked = activeSellForCheck(current).length;
-  for (const sell of activeSellForCheck(current)) {
+  // 4. Проверяем конкретные лоты. Неполная выдача и ошибки API не являются
+  // исчезновением лота. История для одного предмета загружается один раз за цикл.
+  const histories = new Map<string, Promise<Awaited<ReturnType<typeof fetchHistoryAll>>>>();
+  result.sellChecked = activeSell.length;
+  for (const sell of activeSell) {
     try {
       const snap = await getSnapshot(sell.region, sell.itemId);
-      const expectedEnd = sell.expectedEndTime ? new Date(sell.expectedEndTime) : null;
-      const found = snap.lots.some((lot) =>
-        sellLotMatches(lot, {
-          targetLotId: sell.targetLotId,
-          price: sell.price,
-          amount: sell.amount ?? 1,
-          upgrade: sell.upgrade ?? 0,
-          quality: sell.quality ?? 0,
-          qualityMode: sell.qualityMode ?? "exact",
-          expectedEndTime: expectedEnd,
-        }),
-      );
-      if (found) {
-        // Лот на месте — обновляем отметку в памяти, в базу пишем отложенно
-        sell.lastSeenAt = new Date();
-        sell.missCount = 0;
-        pendingSell.set(sell.id, { lastSeenAt: sell.lastSeenAt, missCount: 0 });
+      const now = Date.now();
+      const found = snap.lots.find((lot) => sellLotMatches(lot, sell));
+      const foundEnd = found?.endTime ? new Date(found.endTime) : sell.expectedEndTime;
+      const stillLive = found && (!foundEnd || now < foundEnd.getTime() + SALE_GRACE_MS);
+      if (stillLive) {
+        const wasMissing = sell.missCount > 0 || sell.firstMissingAt !== null;
+        const patch: PendingSellWrite = {
+          targetLotId: found.id, lastSeenAt: new Date(now), lastCheckedAt: new Date(now),
+          expectedEndTime: foundEnd, startTime: found.startTime ? new Date(found.startTime) : sell.startTime,
+          quality: found.quality, upgrade: found.upgrade, price: found.buyoutPrice || found.startPrice,
+          amount: found.amount, qualityName: QUALITY_NAMES[found.quality] || "Неизвестна",
+          missCount: 0, firstMissingAt: null, lastError: null,
+        };
+        Object.assign(sell, patch);
+        pendingSell.set(sell.id, { ...pendingSell.get(sell.id), ...patch });
+        if (wasMissing) {
+          await db.update(sellTrackers).set(patch).where(and(eq(sellTrackers.id, sell.id), eq(sellTrackers.status, "active")));
+          pendingSell.delete(sell.id);
+          invalidateAll();
+          result.dbTouched = true;
+        }
         continue;
       }
-
-      // Лота нет в выдаче. Требуется 2 подряд промаха — защита от глюков EAPI.
-      const misses = (sell.missCount ?? 0) + 1;
-      sell.missCount = misses;
-      if (misses < 2) {
-        pendingSell.set(sell.id, { lastSeenAt: sell.lastSeenAt ?? new Date(), missCount: misses });
+      if (!snap.complete && (!sell.expectedEndTime || now < sell.expectedEndTime.getTime() + SALE_GRACE_MS)) {
+        const patch = { lastCheckedAt: new Date(now), lastError: "Выдача EXBO неполная. Статус лота пока не меняем." };
+        Object.assign(sell, patch);
+        pendingSell.set(sell.id, { ...pendingSell.get(sell.id), ...patch });
         continue;
       }
+      const firstMiss = sell.missCount === 0;
+      sell.missCount++;
+      sell.firstMissingAt ??= new Date(now);
+      sell.lastCheckedAt = new Date(now);
+      sell.lastError = null;
+      pendingSell.set(sell.id, { ...pendingSell.get(sell.id), missCount: sell.missCount,
+        firstMissingAt: sell.firstMissingAt, lastCheckedAt: sell.lastCheckedAt, lastError: null });
+      if (firstMiss) {
+        // Сохраняем переход сразу: сон/перезапуск сервера не должен обнулять
+        // время исчезновения и оставлять лот активным навсегда.
+        await db.update(sellTrackers).set(pendingSell.get(sell.id)!).where(and(eq(sellTrackers.id, sell.id), eq(sellTrackers.status, "active")));
+        pendingSell.delete(sell.id);
+        invalidateAll();
+        result.dbTouched = true;
+      }
+      if (sell.missCount < 2) continue;
 
-      // Исчезновение подтверждено. Продан или истёк?
-      const now = new Date();
-      const endTs = expectedEnd ? expectedEnd.getTime() : null;
-      const expiredByTime = endTs !== null && now.getTime() >= endTs - 5 * 60_000;
-
-      // Ищем подтверждение продажи в истории. ВАЖНО: раньше сверялись только цена,
-      // заточка и редкость — из-за чего обычный предмет, проданный по цене
-      // исключительного, засчитывался как продажа исключительного. Теперь
-      // сверяем ВСЕ атрибуты, а историю берём параллельными пачками сразу
-      // на 200 записей, чтобы совпадение не потерялось глубже первой сотни.
-      let soldAt: Date | null = null;
+      let hist: Awaited<ReturnType<typeof fetchHistoryAll>> | null = null;
+      const key = `${sell.region}|${sell.itemId}`;
       try {
-        const hist = await fetchHistoryAll(sell.itemId, sell.region, 200);
-        const since = (sell.createdAt ? new Date(sell.createdAt).getTime() : 0) - 10 * 60_000;
-        const hit = hist.history.find(
-          (h) =>
-            h.price === sell.price &&
-            h.upgrade === (sell.upgrade ?? 0) &&
-            h.quality === (sell.quality ?? 0) &&
-            h.time !== null &&
-            new Date(h.time).getTime() >= since,
-        );
-        if (hit?.time) soldAt = new Date(hit.time);
-      } catch {
-        // историю не получили — решаем по сроку
-      }
-
-      // Если время уже вышло и истории о продаже нет — это точно истечение,
-      // а не продажа. Раньше "продан по умолчанию" давал ложные срабатывания.
-      const sold = soldAt !== null && !expiredByTime;
-      const status = sold ? "sold" : "expired";
-      const finishedAt = soldAt ?? now;
-      if (sold) result.sellSold++;
-      else result.sellExpired++;
-
-      await db.update(sellTrackers).set({
-        status,
-        finishedAt,
-        finishPrice: sell.price,
-        missCount: misses,
-      }).where(eq(sellTrackers.id, sell.id));
+        if (!histories.has(key)) histories.set(key, fetchHistoryAll(sell.itemId, sell.region, 2000));
+        hist = await histories.get(key)!;
+      } catch { /* временно оставляем статус неопределённым */ }
+      const since = Math.max(sell.createdAt?.getTime() ?? 0, sell.lastSeenAt?.getTime() ?? 0) - 5000;
+      const coversPeriod = !!hist && (hist.complete || hist.history.some((h) => h.time && Date.parse(h.time) <= since));
+      const decision = decideMissingSale(sell, hist?.history ?? null, coversPeriod, now);
+      if (!decision) continue;
+      const { status, finishedAt, price } = decision;
+      const qualityName = sell.qualityName || QUALITY_NAMES[sell.quality] || "Неизвестна";
+      // Статус и уведомление сохраняем атомарно: повторный запуск не потеряет
+      // уведомление и не создаст второе для уже завершённой продажи.
+      const changed = await db.transaction(async (tx) => {
+        const updated = await tx.update(sellTrackers).set({
+          status, finishedAt, finishPrice: price, missCount: sell.missCount,
+          firstMissingAt: sell.firstMissingAt, lastCheckedAt: sell.lastCheckedAt, lastError: null,
+        }).where(and(eq(sellTrackers.id, sell.id), eq(sellTrackers.status, "active"))).returning({ id: sellTrackers.id });
+        if (!updated.length) return false;
+        await tx.insert(notifications).values({
+          kind: `sell_${status}`, ownerKey: sell.ownerKey, trackerId: null,
+          itemId: sell.itemId, itemName: sell.itemName, itemIcon: sell.itemIcon,
+          region: sell.region, lotId: sell.targetLotId, price: price ?? sell.price,
+          upgrade: sell.upgrade, quality: sell.quality, qualityName,
+          message: status === "sold" ? `Продан за ${sell.price.toLocaleString("ru-RU")} ₽`
+            : status === "expired" ? "Срок лота истёк; продажа в доступной истории не найдена"
+            : "Лот исчез. Продажа не подтверждена — проверьте результат в игре",
+          targetChatIds: (sell.ownerKey ? (chatsByOwner.get(sell.ownerKey) || []) : []).map((chat) => chat.chatId),
+          sentChatIds: [], retryAt: new Date(),
+        });
+        return true;
+      });
       sell.status = status;
       sell.finishedAt = finishedAt;
       pendingSell.delete(sell.id);
-      invalidateAll();
-      result.dbTouched = true;
-
-      // Уведомление в общую очередь с пометкой вида — уйдёт в Telegram с нужным текстом
-      const kind = sold ? "sell_sold" : "sell_expired";
-      const qn = sell.qualityName || QUALITY_NAMES[sell.quality ?? 0] || "Обычный";
-      await db.insert(notifications).values({
-        kind,
-        ownerKey: sell.ownerKey,
-        trackerId: null,
-        itemId: sell.itemId,
-        itemName: sell.itemName,
-        itemIcon: sell.itemIcon,
-        region: sell.region,
-        lotId: sell.targetLotId,
-        price: sell.price,
-        upgrade: sell.upgrade ?? 0,
-        quality: sell.quality ?? 0,
-        qualityName: qn,
-        message: sold
-          ? `Продан за ${sell.price.toLocaleString("ru-RU")} ₽`
-          : `Срок истёк, лот пропал из аукциона`,
-        targetChatIds: (sell.ownerKey ? (chatsByOwner.get(sell.ownerKey) || []) : []).map((c) => c.chatId),
-        sentChatIds: [],
-        retryAt: new Date(),
-      }).onConflictDoNothing();
-      hasPendingDeliveries = true;
-    } catch (e) {
-      console.error("sell tracker check failed:", sell.id, e instanceof Error ? e.message : e);
+      if (changed) {
+        if (status === "sold") result.sellSold++;
+        else if (status === "expired") result.sellExpired++;
+        hasPendingDeliveries = true;
+        nextDeliveryAt = 0;
+        invalidateAll();
+        result.dbTouched = true;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "EXBO EAPI недоступен";
+      sell.lastError = message;
+      pendingSell.set(sell.id, { ...pendingSell.get(sell.id), lastError: message });
+      result.failed++;
+      result.errors.push(`${sell.itemName}: ${message}`);
+      console.error("sell tracker check failed:", sell.id, message);
     }
   }
 
   // 5. Досылка застрявших уведомлений — только если есть что досылать
-  if (hasPendingDeliveries) {
+  if (current.telegramEnabled && hasPendingDeliveries && Date.now() >= nextDeliveryAt) {
     try {
       result.telegramSent += await deliverPending(current.chats, current.siteUrl);
       result.dbTouched = true;
@@ -721,11 +653,6 @@ async function check(source: string): Promise<CheckResult> {
     + `db=${result.dbTouched ? "yes" : "no"}, stateAge=${result.stateAgeSec}s`
   );
   return result;
-}
-
-/** Активные продажи из кэша (перечитывается при синхронизации) */
-function activeSellForCheck(current: EcoState): SellTrackerRow[] {
-  return current.sellTrackers.filter((s) => s.status === "active");
 }
 
 export async function runTrackerCheck(source: string): Promise<CheckResult> {
@@ -747,4 +674,12 @@ export function getEcoStatus() {
     pendingWrites: pending.size,
     trackersCached: state?.trackers.length ?? 0,
   };
+}
+
+export function liveTrackerRows<T extends { id: number }>(rows: T[]): T[] {
+  return rows.map((row) => ({ ...row, ...pending.get(row.id) }));
+}
+
+export function liveSellRows<T extends { id: number }>(rows: T[]): T[] {
+  return rows.map((row) => ({ ...row, ...pendingSell.get(row.id) }));
 }

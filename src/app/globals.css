@@ -151,58 +151,41 @@ button:disabled {
   cursor: not-allowed;
 }
 
-/* ===== Оптимизация под телефоны ===== */
-@media(max-width:800px){
-  .metric{padding:11px}
-  .metric>strong{font-size:16px;margin-top:9px}
-  .chart-panel{padding:12px}
-  .table-tabs{gap:14px}
-  .table-tabs button{font-size:11.5px}
-  /* Лоты и история: на телефоне колонки перестраиваются в 2 строки,
-     где цена+заточка сверху, редкость+время снизу */
-  .tracking-summary>div,.tracking-summary>a{min-width:0}
-  .tracker-card{padding:13px}
-  .tracker-conditions{gap:5px;margin:16px 0 11px}
-  .tracker-conditions>span{font-size:9.5px;padding:4px 6px}
-  /* Каталог: карточки компактнее, чтобы влезало 2 в ряд на узких экранах */
-  .item-card{min-height:180px}
-  .item-card h3{font-size:11.5px}
-  /* Фильтры истории и лотов — прокручиваются вбок, не ломая сетку */
-  .catalog-tools{flex-wrap:nowrap}
-  .catalog-tools>select{min-width:118px;font-size:11px;padding-left:6px;padding-right:22px}
-  .segmented{max-width:100%;overflow-x:auto}
+/* Мобильные правила используют реальные классы компонентов. */
+html { overflow-x: clip; }
+button, input, select { -webkit-tap-highlight-color: transparent; }
+button, a, input, select { touch-action: manipulation; }
+:focus-visible { outline: 2px solid #34d399; outline-offset: 3px; }
+.mobile-bottom-nav { padding-bottom: env(safe-area-inset-bottom, 0px); }
+.modal-panel { max-height: calc(100dvh - 24px); overscroll-behavior: contain; }
+.upgrade-chips { scrollbar-width: thin; }
+.upgrade-chips button { flex-shrink: 0; }
+.auction-row > * { min-width: 0; }
+.auction-row .mono { overflow-wrap: anywhere; }
+
+@media (max-width: 1023px) {
+  .app-main { padding-bottom: calc(90px + env(safe-area-inset-bottom, 0px)); }
+  .catalog-categories { display: none; }
 }
-@media(max-width:540px){
-  /* Строки таблиц: цена занимает всю ширину первой строки */
-  td{padding:10px 12px}
-  th{padding:10px 12px;font-size:7.5px;letter-spacing:.6px}
-  .data-panel{border-radius:10px}
-  .pagination{font-size:10.5px;gap:7px}
-  .page-buttons button{min-width:28px;height:28px}
-  /* Итог по фильтру: карточки в 2 колонки, а не в столбик */
-  .sell-summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
-  .tracker-actions{gap:6px}
-  .tracker-actions .secondary-btn{font-size:10.5px;padding:6px 8px}
-  /* Панель фильтров — компактнее */
-  .lots-sort{gap:8px;font-size:10px}
-  .lots-sort select{font-size:10px}
-  /* Навигация: активный пункт подсвечен, остальное скроллится */
-  .main-nav a{font-size:12px;padding:6px 8px}
-  .brand>span:last-child{font-size:16px}
-  /* Поиск: кнопка Открыть не наезжает на текст */
-  .search-field input{font-size:12.5px}
-  .region-control>select{min-width:66px;font-size:10.5px}
-  .telegram-nav{font-size:0;gap:0;padding:8px}
-  .telegram-nav svg{width:18px;height:18px}
-  .topbar{height:60px}
-  .topbar-inner{height:60px}
-  .mobile-nav{top:59px}
-  .main-content{padding-left:12px;padding-right:12px}
-  .empty-state{padding:22px 16px;min-height:200px}
-  .empty-symbol{width:48px;height:48px;margin-bottom:14px}
+@media (max-width: 767px) {
+  input, select, textarea { font-size: 16px !important; } /* Не приближать страницу при вводе на iOS. */
+  .app-header button { min-height: 44px; }
+  .pagination { gap: 8px; padding: 12px 8px; }
+  .pagination button { min-height: 44px; padding-inline: 10px; }
+  .pagination > span { white-space: nowrap; }
+  .auction-row { gap: 10px; padding: 16px 12px; }
+  .auction-row button { min-width: 44px; min-height: 44px; }
+  .auction-tabs { width: 100%; }
+  .auction-tabs > button { flex: 1; padding: 10px 6px; font-size: 12px; }
+  .modal-panel button { min-height: 44px; }
+  .sell-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .sell-summary-grid > * { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 }
-@media(max-width:380px){
-  .item-grid{grid-template-columns:1fr}
-  .metrics-grid{grid-template-columns:1fr 1fr}
-  .tracking-summary{grid-template-columns:1fr}
+@media (max-width: 380px) {
+  .app-main { padding-left: 12px; padding-right: 12px; }
+  .auction-row { grid-template-columns: minmax(0, 1fr); }
+  .auction-row > :nth-child(3)::before { content: "Заточка: "; color: #a1a1aa; margin-right: 6px; font-size: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
 }

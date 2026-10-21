@@ -10,7 +10,7 @@ export async function GET(
 ) {
   try {
     const { id } = await params;
-    const itemId = id.toLowerCase();
+    const itemId = id;
 
     // Из памяти — база не просыпается
     const item = await getCatalogItem(itemId);

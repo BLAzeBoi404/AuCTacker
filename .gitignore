@@ -26,3 +26,7 @@ Thumbs.db
 
 # Drizzle
 drizzle/*.sql
+
+# Локальные результаты проверок
+/test-results/
+/playwright-report/

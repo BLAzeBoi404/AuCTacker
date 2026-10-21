@@ -1,3 +1,4 @@
+import { boundedInt } from "@/lib/validation";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { items } from "@/db/schema";
@@ -26,7 +27,7 @@ async function tryAdoptUnlistedItem(id: string): Promise<CatalogItem | null> {
         iconUrl: FALLBACK_ICON,
         color: null,
         dataPath: null,
-        search: id.toLowerCase(),
+        search: id,
       };
       await db
         .insert(items)
@@ -57,8 +58,8 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const q = (searchParams.get("q") || "").trim();
     const category = (searchParams.get("category") || "").trim();
-    const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") || 30)));
-    const offset = Math.max(0, Number(searchParams.get("offset") || 0));
+    const limit = boundedInt(searchParams.get("limit"), 30, 1, 100);
+    const offset = boundedInt(searchParams.get("offset"), 0, 0, 100_000);
 
     // Поиск идёт из памяти — база не просыпается
     const found = await searchCatalog(q, category, limit, offset);
@@ -66,7 +67,7 @@ export async function GET(req: NextRequest) {
     // Предмета нет в справочнике, но пользователь ввёл ID:
     // часть предметов EXBO не публикует, хотя они торгуются на аукционе.
     if (found.total === 0 && /^[a-z0-9]{3,12}$/i.test(q)) {
-      const adopted = await tryAdoptUnlistedItem(q.toLowerCase());
+      const adopted = await tryAdoptUnlistedItem(q);
       if (adopted) {
         return NextResponse.json({
           success: true,

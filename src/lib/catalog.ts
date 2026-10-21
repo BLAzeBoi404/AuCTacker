@@ -1,5 +1,6 @@
 import { db } from "@/db";
 import { sql } from "drizzle-orm";
+import { normalizeSearch, searchRank } from "./search";
 import { ensureSchema } from "./ensure-schema";
 import { ensureItemsSeeded } from "./exbo";
 
@@ -53,7 +54,7 @@ async function load(): Promise<CatalogCache> {
 
   const items = (res.rows as unknown as Omit<CatalogItem, "search">[]).map((row) => ({
     ...row,
-    search: `${row.nameRu} ${row.nameEn || ""} ${row.id}`.toLowerCase(),
+    search: normalizeSearch(`${row.nameRu} ${row.nameEn || ""} ${row.id}`),
   }));
 
   const counts = new Map<string, number>();
@@ -101,7 +102,7 @@ export async function searchCatalog(
 ): Promise<SearchResult> {
   const wasCached = cache !== null;
   const data = await getCache();
-  const q = query.trim().toLowerCase();
+  const q = normalizeSearch(query);
   const cat = category.trim().toLowerCase();
   const filterCat = cat && cat !== "all";
 
@@ -118,9 +119,8 @@ export async function searchCatalog(
   // Точное совпадение по ID и коротким названиям — выше в списке
   if (q) {
     matched = [...matched].sort((a, b) => {
-      const aExact = a.id === q ? 0 : a.nameRu.toLowerCase().includes(q) ? 1 : 2;
-      const bExact = b.id === q ? 0 : b.nameRu.toLowerCase().includes(q) ? 1 : 2;
-      return aExact - bExact || a.nameRu.length - b.nameRu.length;
+      return searchRank(a, query) - searchRank(b, query)
+        || a.nameRu.length - b.nameRu.length || a.id.localeCompare(b.id);
     });
   }
 
@@ -135,7 +135,11 @@ export async function searchCatalog(
 /** Предмет по ID — тоже из памяти */
 export async function getCatalogItem(id: string): Promise<CatalogItem | null> {
   const data = await getCache();
-  return data.byId.get(id.toLowerCase()) || null;
+  const exact = data.byId.get(id);
+  if (exact) return exact;
+  // Старые ссылки сохраняем только при однозначном совпадении.
+  const matches = data.items.filter((item) => item.id.toLowerCase() === id.toLowerCase());
+  return matches.length === 1 ? matches[0] : null;
 }
 
 /** Добавить предмет в кэш, не перечитывая всю базу */

@@ -9,33 +9,22 @@
  * время и сбрасываем сразу при любой записи — пользователь всегда видит
  * актуальное состояние, а база спит.
  */
-const TTL_MS = 60_000;
+import { AsyncCache } from "./async-cache";
 
-interface Entry<T> {
-  value: T;
-  exp: number;
-}
-
-const store = new Map<string, Entry<unknown>>();
+const store = new AsyncCache(60_000, 500);
 
 export async function cached<T>(key: string, loader: () => Promise<T>): Promise<T> {
-  const hit = store.get(key);
-  if (hit && Date.now() < hit.exp) return hit.value as T;
-  const value = await loader();
-  store.set(key, { value, exp: Date.now() + TTL_MS });
-  return value;
+  return store.get(key, loader) as Promise<T>;
 }
 
 /** Сбросить записи профиля (после создания/изменения/удаления) */
 export function invalidateOwner(ownerKey: string): void {
-  for (const key of store.keys()) {
-    if (key.endsWith(`:${ownerKey}`)) store.delete(key);
-  }
+  store.invalidate((key) => key.endsWith(`:${ownerKey}`));
 }
 
 /** Сбросить всё (после фоновой проверки, которая могла создать уведомления) */
 export function invalidateAll(): void {
-  store.clear();
+  store.invalidate();
 }
 
 export function userCacheSize(): number {

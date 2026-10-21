@@ -1,3 +1,4 @@
+import { boundedInt } from "@/lib/validation";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { notifications } from "@/db/schema";
@@ -14,7 +15,7 @@ export async function GET(req: NextRequest) {
     await ensureSchema();
     const owner = await getOwnerKey();
     const { searchParams } = new URL(req.url);
-    const limit = Math.min(100, Math.max(1, Number(searchParams.get("limit") || 30)));
+    const limit = boundedInt(searchParams.get("limit"), 30, 1, 100);
     const rows = await cached(`notif:${limit}:${owner}`, () =>
       db.select().from(notifications)
         .where(eq(notifications.ownerKey, owner))

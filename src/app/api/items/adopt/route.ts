@@ -33,7 +33,7 @@ export async function POST(req: NextRequest) {
       iconUrl?: string;
     };
 
-    const id = String(body.id || "").trim().toLowerCase();
+    const id = String(body.id || "").trim();
     if (!/^[a-z0-9]{3,12}$/.test(id)) {
       return NextResponse.json(
         { success: false, error: "bad_id", message: "ID должен состоять из 3–12 латинских букв и цифр." },

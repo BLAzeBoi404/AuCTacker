@@ -5,7 +5,7 @@ export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const itemId = (searchParams.get("itemId") || "").toLowerCase().trim();
+  const itemId = (searchParams.get("itemId") || "").trim();
   const region = normalizeRegion(searchParams.get("region"));
   if (!itemId) return NextResponse.json({ success: false, error: "itemId_required" });
 
@@ -33,15 +33,16 @@ export async function GET(req: NextRequest) {
 
     // Изменение за 24ч
     const now = Date.now();
-    const last24 = histSorted.filter((h) => h.time && now - new Date(h.time).getTime() < 86400000);
+    const last24 = histSorted.filter((h) => h.time && now >= new Date(h.time).getTime() && now - new Date(h.time).getTime() < 86400000);
     const prev24 = histSorted.filter(
       (h) => h.time && now - new Date(h.time).getTime() >= 86400000 && now - new Date(h.time).getTime() < 172800000
     );
     const avg = (arr: number[]) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
-    const avg24 = avg(last24.map((h) => h.price).filter((p) => p > 0));
-    const avgPrev = avg(prev24.map((h) => h.price).filter((p) => p > 0));
-    const change24 = avgPrev > 0 ? ((avg24 - avgPrev) / avgPrev) * 100 : 0;
+    const avg24 = avg(last24.map((h) => perUnit(h.price, h.amount)).filter((p) => p > 0));
+    const avgPrev = avg(prev24.map((h) => perUnit(h.price, h.amount)).filter((p) => p > 0));
+    const change24 = avg24 > 0 && avgPrev > 0 ? ((avg24 - avgPrev) / avgPrev) * 100 : 0;
 
+    const latest = histSorted.find((h) => h.price > 0);
     return NextResponse.json({
       success: true,
       region,
@@ -53,7 +54,7 @@ export async function GET(req: NextRequest) {
       },
       history: {
         count: histRes.total,
-        last: histSorted.find((h) => h.price > 0)?.price || 0,
+        last: latest ? perUnit(latest.price, latest.amount) : 0,
         min: histPrices.length ? Math.min(...histPrices) : 0,
         max: histPrices.length ? Math.max(...histPrices) : 0,
         avg: histPrices.length ? Math.round(avg(histPrices)) : 0,
